@@ -73,6 +73,7 @@ export async function extractController(
     status: "processing",
     showSteps: req.body.__experimental_streamSteps,
     showLLMUsage: req.body.__experimental_llmUsage,
+    showSources: req.body.__experimental_showSources || req.body.showSources,
   });
 
   if (Sentry.isInitialized()) {
@@ -95,7 +96,7 @@ export async function extractController(
             baggage: Sentry.spanToBaggageHeader(span),
             size,
           },
-        });
+        }, { jobId: extractId });
       },
     );
   } else {

@@ -5,10 +5,14 @@ import { CustomError } from "../lib/custom-error";
 import {
   getScrapeQueue,
   getExtractQueue,
+  getDeepResearchQueue,
   redisConnection,
   scrapeQueueName,
   extractQueueName,
+  deepResearchQueueName,
   getIndexQueue,
+  getGenerateLlmsTxtQueue,
+  getBillingQueue,
 } from "./queue-service";
 import { startWebScraperPipeline } from "../main/runWebScraper";
 import { callWebhook } from "./webhook";
@@ -29,6 +33,7 @@ import {
   getCrawl,
   getCrawlJobCount,
   getCrawlJobs,
+  getDoneJobsOrderedLength,
   lockURL,
   lockURLs,
   lockURLsIndividually,
@@ -63,6 +68,10 @@ import { normalizeUrl, normalizeUrlOnlyHostname } from "../lib/canonical-url";
 import { saveExtract, updateExtract } from "../lib/extract/extract-redis";
 import { billTeam } from "./billing/credit_billing";
 import { saveCrawlMap } from "./indexing/crawl-maps-index";
+import { updateDeepResearch } from "../lib/deep-research/deep-research-redis";
+import { performDeepResearch } from "../lib/deep-research/deep-research-service";
+import { performGenerateLlmsTxt } from "../lib/generate-llmstxt/generate-llmstxt-service";
+import { updateGeneratedLlmsTxt } from "../lib/generate-llmstxt/generate-llmstxt-redis";
 
 configDotenv();
 
@@ -184,7 +193,7 @@ async function finishCrawlIfNeeded(job: Job & { id: string }, sc: StoredCrawl) {
         );
       }
     } else {
-      const num_docs = await getCrawlJobCount(job.data.crawl_id);
+      const num_docs = await getDoneJobsOrderedLength(job.data.crawl_id);
       const jobStatus = sc.cancelled ? "failed" : "completed";
 
       await logJob(
@@ -234,7 +243,15 @@ const processJobInternal = async (token: string, job: Job & { id: string }) => {
   });
 
   const extendLockInterval = setInterval(async () => {
-    logger.info(`🐂 Worker extending lock on job ${job.id}`);
+    logger.info(`🐂 Worker extending lock on job ${job.id}`, {
+      extendInterval: jobLockExtendInterval,
+      extensionTime: jobLockExtensionTime,
+    });
+
+    if (job.data?.mode !== "kickoff" && job.data?.team_id) {
+      await pushConcurrencyLimitActiveJob(job.data.team_id, job.id, 60 * 1000); // 60s lock renew, just like in the queue
+    }
+
     await job.extendLock(token, jobLockExtensionTime);
   }, jobLockExtendInterval);
 
@@ -367,6 +384,149 @@ const processExtractJobInternal = async (
   }
 };
 
+const processDeepResearchJobInternal = async (
+  token: string,
+  job: Job & { id: string },
+) => {
+  const logger = _logger.child({
+    module: "deep-research-worker",
+    method: "processJobInternal",
+    jobId: job.id,
+    researchId: job.data.researchId,
+    teamId: job.data?.teamId ?? undefined,
+  });
+
+  const extendLockInterval = setInterval(async () => {
+    logger.info(`🔄 Worker extending lock on job ${job.id}`);
+    await job.extendLock(token, jobLockExtensionTime);
+  }, jobLockExtendInterval);
+
+  try {
+    console.log("[Deep Research] Starting deep research: ", job.data.researchId);
+    const result = await performDeepResearch({
+      researchId: job.data.researchId,
+      teamId: job.data.teamId,
+      plan: job.data.plan,
+      topic: job.data.request.topic,
+      maxDepth: job.data.request.maxDepth,
+      timeLimit: job.data.request.timeLimit,
+      subId: job.data.subId,
+      maxUrls: job.data.request.maxUrls,
+    });  
+    
+    if(result.success) {
+      // Move job to completed state in Redis and update research status
+      await job.moveToCompleted(result, token, false);
+      return result;
+    } else {
+      // If the deep research failed but didn't throw an error
+      const error = new Error("Deep research failed without specific error");
+      await updateDeepResearch(job.data.researchId, {
+        status: "failed",
+        error: error.message,
+      });
+      await job.moveToFailed(error, token, false);
+
+      return { success: false, error: error.message };
+    }
+  } catch (error) {
+    logger.error(`🚫 Job errored ${job.id} - ${error}`, { error });
+
+    Sentry.captureException(error, {
+      data: {
+        job: job.id,
+      },
+    });
+
+    try {
+      // Move job to failed state in Redis
+      await job.moveToFailed(error, token, false);
+    } catch (e) {
+      logger.error("Failed to move job to failed state in Redis", { error });
+    }
+
+    await updateDeepResearch(job.data.researchId, {
+      status: "failed",
+      error: error.message || "Unknown error occurred",
+    });
+
+    return { success: false, error: error.message || "Unknown error occurred" };
+  } finally {
+    clearInterval(extendLockInterval);
+  }
+};
+
+const processGenerateLlmsTxtJobInternal = async (
+  token: string,
+  job: Job & { id: string },
+) => {
+  const logger = _logger.child({
+    module: "generate-llmstxt-worker",
+    method: "processJobInternal", 
+    jobId: job.id,
+    generateId: job.data.generateId,
+    teamId: job.data?.teamId ?? undefined,
+  });
+
+  const extendLockInterval = setInterval(async () => {
+    logger.info(`🔄 Worker extending lock on job ${job.id}`);
+    await job.extendLock(token, jobLockExtensionTime);
+  }, jobLockExtendInterval);
+
+  try {
+    const result = await performGenerateLlmsTxt({
+      generationId: job.data.generationId,
+      teamId: job.data.teamId,
+      plan: job.data.plan,
+      url: job.data.request.url,
+      maxUrls: job.data.request.maxUrls,
+      showFullText: job.data.request.showFullText,
+      subId: job.data.subId,
+    });
+
+    if (result.success) {
+      await job.moveToCompleted(result, token, false);
+      await updateGeneratedLlmsTxt(job.data.generateId, {
+        status: "completed",
+        generatedText: result.data.generatedText,
+        fullText: result.data.fullText,
+      });
+      return result;
+    } else {
+      const error = new Error("LLMs text generation failed without specific error");
+      await job.moveToFailed(error, token, false);
+      await updateGeneratedLlmsTxt(job.data.generateId, {
+        status: "failed",
+        error: error.message,
+      });
+      return { success: false, error: error.message };
+    }
+  } catch (error) {
+    logger.error(`🚫 Job errored ${job.id} - ${error}`, { error });
+
+    Sentry.captureException(error, {
+      data: {
+        job: job.id,
+      },
+    });
+
+    try {
+      await job.moveToFailed(error, token, false);
+    } catch (e) {
+      logger.error("Failed to move job to failed state in Redis", { error });
+    }
+
+    await updateGeneratedLlmsTxt(job.data.generateId, {
+      status: "failed", 
+      error: error.message || "Unknown error occurred",
+    });
+
+    return { success: false, error: error.message || "Unknown error occurred" };
+  } finally {
+    clearInterval(extendLockInterval);
+  }
+};
+
 let isShuttingDown = false;
 
 process.on("SIGINT", () => {
@@ -443,7 +603,7 @@ const workerFun = async (
           // we are 1 under the limit, assuming the job insertion logic never over-inserts. - MG
           const nextJob = await takeConcurrencyLimitedJob(job.data.team_id);
           if (nextJob !== null) {
-            await pushConcurrencyLimitActiveJob(job.data.team_id, nextJob.id);
+            await pushConcurrencyLimitActiveJob(job.data.team_id, nextJob.id, 60 * 1000); // 60s initial timeout
 
             await queue.add(
               nextJob.id,
@@ -881,7 +1041,7 @@ async function processJob(job: Job & { id: string }, token: string) {
           );
 
           const links = crawler.filterLinks(
-            crawler.extractLinksFromHTML(
+            await crawler.extractLinksFromHTML(
               rawHtml ?? "",
               doc.metadata?.url ?? doc.metadata?.sourceURL ?? sc.originUrl!,
             ),
@@ -960,16 +1120,38 @@ async function processJob(job: Job & { id: string }, token: string) {
         creditsToBeBilled = 5;
       }
 
-      if (job.data.team_id !== process.env.BACKGROUND_INDEX_TEAM_ID!) {
-        billTeam(job.data.team_id, undefined, creditsToBeBilled, logger).catch(
-          (error) => {
-            logger.error(
-              `Failed to bill team ${job.data.team_id} for ${creditsToBeBilled} credits`,
-              { error },
-            );
-            // Optionally, you could notify an admin or add to a retry queue here
-          },
-        );
+      if (job.data.team_id !== process.env.BACKGROUND_INDEX_TEAM_ID! && process.env.USE_DB_AUTHENTICATION === "true") {
+        try {
+          const billingJobId = uuidv4();
+          logger.debug(`Adding billing job to queue for team ${job.data.team_id}`, {
+            billingJobId,
+            credits: creditsToBeBilled,
+            is_extract: job.data.scrapeOptions.extract,
+          });
+          
+          // Add directly to the billing queue - the billing worker will handle the rest
+          await getBillingQueue().add(
+            "bill_team",
+            {
+              team_id: job.data.team_id,
+              subscription_id: undefined,
+              credits: creditsToBeBilled,
+              is_extract: job.data.scrapeOptions.extract,
+              timestamp: new Date().toISOString(),
+              originating_job_id: job.id
+            },
+            {
+              jobId: billingJobId,
+              priority: 10,
+            }
+          );
+        } catch (error) {
+          logger.error(
+            `Failed to add billing job to queue for team ${job.data.team_id} for ${creditsToBeBilled} credits`,
+            { error },
+          );
+          Sentry.captureException(error);
+        }
       }
     }
 
@@ -1085,11 +1267,13 @@ async function processJob(job: Job & { id: string }, token: string) {
 // wsq.on("resumed", j => ScrapeEvents.logJobEvent(j, "resumed"));
 // wsq.on("removed", j => ScrapeEvents.logJobEvent(j, "removed"));
 
-// Start both workers
+// Start all workers
 (async () => {
   await Promise.all([
     workerFun(getScrapeQueue(), processJobInternal),
     workerFun(getExtractQueue(), processExtractJobInternal),
+    workerFun(getDeepResearchQueue(), processDeepResearchJobInternal),
+    workerFun(getGenerateLlmsTxtQueue(), processGenerateLlmsTxtJobInternal),
   ]);
 
   console.log("All workers exited. Waiting for all jobs to finish...");

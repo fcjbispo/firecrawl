@@ -28,6 +28,11 @@ content-type: application/json
 GET {{baseUrl}}/v1/crawl/{{crawlId}} HTTP/1.1
 Authorization: Bearer {{$dotenv TEST_API_KEY}}
 
+### Cancel Crawl
+@crawlId = {{crawl.response.body.$.id}}
+# @name cancelCrawl
+DELETE {{baseUrl}}/v1/crawl/{{crawlId}} HTTP/1.1
+Authorization: Bearer {{$dotenv TEST_API_KEY}}
 
 ### Batch Scrape Websites
 # @name batchScrape
@@ -91,3 +96,27 @@ content-type: application/json
 # @name extractFirecrawlStatus 
 GET {{baseUrl}}/v1/extract/{{extractFirecrawlId}} HTTP/1.1
 Authorization: Bearer {{$dotenv TEST_API_KEY}}
+
+###
+DELETE {{baseUrl}}/v1/crawl/c94136f9-86c1-4a97-966c-1c8e0274778f HTTP/1.1
+Authorization: Bearer {{$dotenv TEST_API_KEY}}
+
+### Generate LLMs TXT
+# @name llmsTxt
+POST {{baseUrl}}/v1/llmstxt HTTP/1.1
+Authorization: Bearer {{$dotenv TEST_API_KEY}}
+content-type: application/json
+
+{
+  "url": "https://firecrawl.dev",
+  "maxUrls": 2,
+  "showFullText": false
+}
+
+
+### Check Generate LLMs TXT Status
+@llmsTxtId = {{llmsTxt.response.body.$.id}}
+# @name llmsTxtStatus
+GET {{baseUrl}}/v1/llmstxt/{{llmsTxtId}} HTTP/1.1
+Authorization: Bearer {{$dotenv TEST_API_KEY}}
+

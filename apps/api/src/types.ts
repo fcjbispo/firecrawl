@@ -88,6 +88,7 @@ export interface FirecrawlJob {
   retry?: boolean;
   crawl_id?: string;
   tokens_billed?: number;
+  sources?: Record<string, string[]>;
 }
 
 export interface FirecrawlScrapeResponse {
@@ -157,6 +158,8 @@ export enum NotificationType {
   RATE_LIMIT_REACHED = "rateLimitReached",
   AUTO_RECHARGE_SUCCESS = "autoRechargeSuccess",
   AUTO_RECHARGE_FAILED = "autoRechargeFailed",
+  CONCURRENCY_LIMIT_REACHED = "concurrencyLimitReached",
+  AUTO_RECHARGE_FREQUENT = "autoRechargeFrequent",
 }
 
 export type ScrapeLog = {
@@ -180,12 +183,19 @@ export type PlanType =
   | "scale"
   | "hobby"
   | "standardnew"
+  | "standardNew"
   | "growth"
   | "growthdouble"
   | "etier2c"
   | "etier1a"
   | "etierscale1"
+  | "etierscale2"
+  | "etier2a"
   | "free"
+  | "testSuite"
+  | "devB"
+  | "etier2d"
+  | "manual"
   | "extract_starter"
   | "extract_explorer"
   | "extract_pro"

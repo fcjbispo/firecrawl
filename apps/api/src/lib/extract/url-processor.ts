@@ -3,13 +3,21 @@ import { getMapResults } from "../../controllers/v1/map";
 import { PlanType } from "../../types";
 import { removeDuplicateUrls } from "../validateUrl";
 import { isUrlBlocked } from "../../scraper/WebScraper/utils/blocklist";
-import { generateBasicCompletion } from "../LLM-extraction";
 import { buildPreRerankPrompt, buildRefrasedPrompt } from "./build-prompts";
 import { rerankLinksWithLLM } from "./reranker";
 import { extractConfig } from "./config";
-import { updateExtract } from "./extract-redis";
-import { ExtractStep } from "./extract-redis";
+import type { Logger } from "winston";
+import { generateText } from "ai";
+import { getModel } from "../generic-ai";
 
+export async function generateBasicCompletion(prompt: string) {
+  const { text } = await generateText({
+    model: getModel("gpt-4o"),
+    prompt: prompt,
+    temperature: 0
+  });
+  return text;
+}
 interface ProcessUrlOptions {
   url: string;
   prompt?: string;
@@ -26,6 +34,7 @@ export async function processUrl(
   options: ProcessUrlOptions,
   urlTraces: URLTrace[],
   updateExtractCallback: (links: string[]) => void,
+  logger: Logger,
 ): Promise<string[]> {
   const trace: URLTrace = {
     url: options.url,
@@ -41,6 +50,7 @@ export async function processUrl(
       trace.usedInCompletion = true;
       return [options.url];
     }
+    logger.warn("URL is blocked");
     trace.status = "error";
     trace.error = "URL is blocked";
     trace.usedInCompletion = false;
@@ -63,6 +73,9 @@ export async function processUrl(
   }
 
   try {
+    logger.debug("Running map...", {
+      search: searchQuery,
+    });
     const mapResults = await getMapResults({
       url: baseUrl,
       search: searchQuery,
@@ -79,6 +92,10 @@ export async function processUrl(
     let mappedLinks = mapResults.mapResults as MapDocument[];
     let allUrls = [...mappedLinks.map((m) => m.url), ...mapResults.links];
     let uniqueUrls = removeDuplicateUrls(allUrls);
+    logger.debug("Map finished.", {
+      linkCount: allUrls.length,
+      uniqueLinkCount: uniqueUrls.length,
+    });
 
     // Track all discovered URLs
     uniqueUrls.forEach((discoveredUrl) => {
@@ -96,6 +113,7 @@ export async function processUrl(
 
     // retry if only one url is returned
     if (uniqueUrls.length <= 1) {
+      logger.debug("Running map... (pass 2)");
       const retryMapResults = await getMapResults({
         url: baseUrl,
         teamId: options.teamId,
@@ -111,6 +129,10 @@ export async function processUrl(
       mappedLinks = retryMapResults.mapResults as MapDocument[];
       allUrls = [...mappedLinks.map((m) => m.url), ...mapResults.links];
       uniqueUrls = removeDuplicateUrls(allUrls);
+      logger.debug("Map finished. (pass 2)", {
+        linkCount: allUrls.length,
+        uniqueLinkCount: uniqueUrls.length,
+      });
 
       // Track all discovered URLs
       uniqueUrls.forEach((discoveredUrl) => {
@@ -184,23 +206,35 @@ export async function processUrl(
     //   (link, index) => `${index + 1}. URL: ${link.url}, Title: ${link.title}, Description: ${link.description}`
     // );
 
-    const rerankerResult = await rerankLinksWithLLM(
-      mappedLinks,
+    logger.info("Generated rephrased prompt.", {
       rephrasedPrompt,
+    });
+
+    logger.info("Reranking pass 1 (threshold 0.8)...");
+    const rerankerResult = await rerankLinksWithLLM({
+      links: mappedLinks,
+      searchQuery: rephrasedPrompt,
       urlTraces,
-    );
+    });
     mappedLinks = rerankerResult.mapDocument;
     let tokensUsed = rerankerResult.tokensUsed;
+    logger.info("Reranked! (pass 1)", {
+      linkCount: mappedLinks.length,
+    });
 
     // 2nd Pass, useful for when the first pass returns too many links
     if (mappedLinks.length > 100) {
-      const rerankerResult = await rerankLinksWithLLM(
-        mappedLinks,
-        rephrasedPrompt,
+      logger.info("Reranking (pass 2)...");
+      const rerankerResult = await rerankLinksWithLLM({
+        links: mappedLinks,
+        searchQuery: rephrasedPrompt,
         urlTraces,
-      );
+      });
       mappedLinks = rerankerResult.mapDocument;
       tokensUsed += rerankerResult.tokensUsed;
+      logger.info("Reranked! (pass 2)", {
+        linkCount: mappedLinks.length,
+      });
     }
 
     // dumpToFile(

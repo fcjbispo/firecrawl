@@ -1,5 +1,5 @@
 import { parseApi } from "../lib/parseApi";
-import { getRateLimiter } from "../services/rate-limiter";
+import { getRateLimiter, isTestSuiteToken } from "../services/rate-limiter";
 import {
   AuthResponse,
   NotificationType,
@@ -64,9 +64,8 @@ export async function setCachedACUC(
         throw signal.error;
       }
 
-      // Cache for 10 minutes. This means that changing subscription tier could have
-      // a maximum of 10 minutes of a delay. - mogery
-      await setValue(cacheKeyACUC, JSON.stringify(acuc), 600, true);
+      // Cache for 1 hour. - mogery
+      await setValue(cacheKeyACUC, JSON.stringify(acuc), 3600, true);
     });
   } catch (error) {
     logger.error(`Error updating cached ACUC ${cacheKeyACUC}: ${error}`);
@@ -94,10 +93,12 @@ export async function getACUC(
     let retries = 0;
     const maxRetries = 5;
 
-    let rpcName =
-      mode === RateLimiterMode.Extract || mode === RateLimiterMode.ExtractStatus
-        ? "auth_credit_usage_chunk_extract"
-        : "auth_credit_usage_chunk_test_22_credit_pack_n_extract";
+    let isExtract =
+      mode === RateLimiterMode.Extract ||
+      mode === RateLimiterMode.ExtractStatus;
+    let rpcName = isExtract
+      ? "auth_credit_usage_chunk_extract"
+      : "auth_credit_usage_chunk_test_22_credit_pack_n_extract";
     while (retries < maxRetries) {
       ({ data, error } = await supabase_service.rpc(
         rpcName,
@@ -132,7 +133,7 @@ export async function getACUC(
       setCachedACUC(api_key, chunk);
     }
 
-    return chunk;
+    return chunk ? { ...chunk, is_extract: isExtract } : null;
   } else {
     return null;
   }
@@ -206,7 +207,7 @@ export async function supaAuthenticateUser(
     } else {
       rateLimiter = getRateLimiter(RateLimiterMode.Preview, token);
     }
-    teamId = "preview";
+    teamId = `preview_${iptoken}`;
     plan = "free";
   } else {
     normalizedApi = parseApi(token);
@@ -332,7 +333,12 @@ export async function supaAuthenticateUser(
       mode === RateLimiterMode.Extract ||
       mode === RateLimiterMode.Search)
   ) {
-    return { success: true, team_id: "preview", chunk: null, plan: "free" };
+    return {
+      success: true,
+      team_id: `preview_${iptoken}`,
+      chunk: null,
+      plan: "free",
+    };
     // check the origin of the request and make sure its from firecrawl.dev
     // const origin = req.headers.origin;
     // if (origin && origin.includes("firecrawl.dev")){
@@ -343,6 +349,16 @@ export async function supaAuthenticateUser(
     // }
 
     // return { success: false, error: "Unauthorized: Invalid token", status: 401 };
+  }
+
+  if (token && isTestSuiteToken(token)) {
+    return {
+      success: true,
+      team_id: teamId ?? undefined,
+      // Now we have a test suite plan
+      plan: "testSuite",
+      chunk,
+    };
   }
 
   return {
@@ -378,7 +394,10 @@ function getPlanByPriceId(price_id: string | null): PlanType {
       return "etier1a";
     case process.env.STRIPE_PRICE_ID_ETIER_SCALE_1_MONTHLY:
     case process.env.STRIPE_PRICE_ID_ETIER_SCALE_1_YEARLY:
+    case process.env.STRIPE_PRICE_ID_ETIER_SCALE_1_YEARLY_FIRECRAWL:
       return "etierscale1";
+    case process.env.STRIPE_PRICE_ID_ETIER_SCALE_2_YEARLY:
+      return "etierscale2";
     case process.env.STRIPE_PRICE_ID_EXTRACT_STARTER_MONTHLY:
     case process.env.STRIPE_PRICE_ID_EXTRACT_STARTER_YEARLY:
       return "extract_starter";
