@@ -18,7 +18,7 @@ services:
       - fbnet
     extra_hosts:
       - "host.containers.internal:host-gateway" # Use podman internal host alias
-    restart: unless-stopped
+    restart: always
 
   api:
     <<: *common-service
@@ -53,7 +53,7 @@ services:
     ports:
       - "3005:6001"
     command: [ "pnpm", "run", "start:production" ]
-    restart: unless-stopped
+    restart: always
 
   worker:
     <<: *common-service
@@ -87,14 +87,14 @@ services:
       - playwright-service
       - api
     command: [ "pnpm", "run", "workers" ]
-    restart: unless-stopped
+    restart: always
 
   redis:
     image: redis:alpine
     networks:
       - fbnet
     command: redis-server --bind 0.0.0.0
-    restart: unless-stopped
+    restart: always
 
 networks:
   fbnet:
