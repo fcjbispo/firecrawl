@@ -4,14 +4,13 @@ import { PlanType } from "../../types";
 import { searchAndScrapeSearchResult } from "../../controllers/v1/search";
 import { ResearchLLMService, ResearchStateManager } from "./research-manager";
 import { logJob } from "../../services/logging/log_job";
-import { updateExtract } from "../extract/extract-redis";
 import { billTeam } from "../../services/billing/credit_billing";
 
 interface DeepResearchServiceOptions {
   researchId: string;
   teamId: string;
   plan: string;
-  topic: string;
+  query: string;
   maxDepth: number;
   maxUrls: number;
   timeLimit: number;
@@ -21,7 +20,7 @@ interface DeepResearchServiceOptions {
 export async function performDeepResearch(options: DeepResearchServiceOptions) {
   const { researchId, teamId, plan, timeLimit, subId, maxUrls } = options;
   const startTime = Date.now();
-  let currentTopic = options.topic;
+  let currentTopic = options.query;
   let urlsAnalyzed = 0;
 
   const logger = _logger.child({
@@ -38,7 +37,7 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
     plan,
     options.maxDepth,
     logger,
-    options.topic,
+    options.query,
   );
   const llmService = new ResearchLLMService(logger);
 
@@ -57,7 +56,7 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
       await state.addActivity({
         type: "search",
         status: "processing",
-        message: `Generating search queries for "${currentTopic}"`,
+        message: `Generating deeper search queries for "${currentTopic}"`,
         timestamp: new Date().toISOString(),
         depth: state.getCurrentDepth(),
       });
@@ -192,7 +191,7 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
       await state.addActivity({
         type: "analyze",
         status: "processing",
-        message: "Analyzing findings",
+        message: "Analyzing findings and planning next steps",
         timestamp: new Date().toISOString(),
         depth: state.getCurrentDepth(),
       });
@@ -260,7 +259,7 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
     });
 
     const finalAnalysis = await llmService.generateFinalAnalysis(
-      options.topic,
+      options.query,
       state.getFindings(),
       state.getSummaries(),
     );
@@ -286,7 +285,7 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
       time_taken: (Date.now() - startTime) / 1000,
       team_id: teamId,
       mode: "deep-research",
-      url: options.topic,
+      url: options.query,
       scrapeOptions: options,
       origin: "api",
       num_tokens: 0,
@@ -297,7 +296,7 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
       finalAnalysis: finalAnalysis,
     });
     // Bill team for usage based on URLs analyzed
-    billTeam(teamId, subId, urlsAnalyzed, logger).catch(
+    billTeam(teamId, subId, Math.min(urlsAnalyzed, options.maxUrls), logger).catch(
       (error) => {
         logger.error(
           `Failed to bill team ${teamId} for ${urlsAnalyzed} URLs analyzed`, { teamId, count: urlsAnalyzed, error },
@@ -308,6 +307,7 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
       success: true,
       data: {
         finalAnalysis: finalAnalysis,
+        sources: state.getSources(),
       },
     };
   } catch (error: any) {

@@ -407,7 +407,7 @@ const processDeepResearchJobInternal = async (
       researchId: job.data.researchId,
       teamId: job.data.teamId,
       plan: job.data.plan,
-      topic: job.data.request.topic,
+      query: job.data.request.query,
       maxDepth: job.data.request.maxDepth,
       timeLimit: job.data.request.timeLimit,
       subId: job.data.subId,
@@ -973,7 +973,13 @@ async function processJob(job: Job & { id: string }, token: string) {
           ); // TODO: make this its own error type that is ignored by error tracking
         }
 
-        if (job.data.isCrawlSourceScrape) {
+        // Only re-set originUrl if it's different from the current hostname
+        // This is only done on this condition to handle cross-domain redirects
+        // If this would be done for non-crossdomain redirects, but also for e.g.
+        // redirecting / -> /introduction (like our docs site does), it would
+        // break crawling the entire site without allowBackwardsCrawling - mogery
+        const isHostnameDifferent = normalizeUrlOnlyHostname(doc.metadata.url) !== normalizeUrlOnlyHostname(doc.metadata.sourceURL);
+        if (job.data.isCrawlSourceScrape && isHostnameDifferent) {
           // TODO: re-fetch sitemap for redirect target domain
           sc.originUrl = doc.metadata.url;
           await saveCrawl(job.data.crawl_id, sc);
@@ -1126,7 +1132,7 @@ async function processJob(job: Job & { id: string }, token: string) {
           logger.debug(`Adding billing job to queue for team ${job.data.team_id}`, {
             billingJobId,
             credits: creditsToBeBilled,
-            is_extract: job.data.scrapeOptions.extract,
+            is_extract: false,
           });
           
           // Add directly to the billing queue - the billing worker will handle the rest
@@ -1136,7 +1142,7 @@ async function processJob(job: Job & { id: string }, token: string) {
               team_id: job.data.team_id,
               subscription_id: undefined,
               credits: creditsToBeBilled,
-              is_extract: job.data.scrapeOptions.extract,
+              is_extract: false,
               timestamp: new Date().toISOString(),
               originating_job_id: job.id
             },
