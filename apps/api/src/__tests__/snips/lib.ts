@@ -1,7 +1,7 @@
 import { configDotenv } from "dotenv";
 configDotenv();
 
-import { ScrapeRequestInput, Document, ExtractRequestInput, ExtractResponse, CrawlRequestInput, MapRequestInput, BatchScrapeRequestInput, SearchRequestInput } from "../../controllers/v1/types";
+import { ScrapeRequestInput, Document, ExtractRequestInput, ExtractResponse, CrawlRequestInput, MapRequestInput, BatchScrapeRequestInput, SearchRequestInput, CrawlStatusResponse } from "../../controllers/v1/types";
 import request from "supertest";
 
 // =========================================
@@ -69,7 +69,7 @@ function expectCrawlToSucceed(response: Awaited<ReturnType<typeof crawlStatus>>)
     expect(response.body.data.length).toBeGreaterThan(0);
 }
 
-export async function crawl(body: CrawlRequestInput): ReturnType<typeof crawlStatus> {
+export async function crawl(body: CrawlRequestInput): Promise<CrawlStatusResponse> {
     const cs = await crawlStart(body);
     expectCrawlStartToSucceed(cs);
 
@@ -82,7 +82,7 @@ export async function crawl(body: CrawlRequestInput): ReturnType<typeof crawlSta
     } while (x.body.status === "scraping");
 
     expectCrawlToSucceed(x);
-    return x;
+    return x.body;
 }
 
 // =========================================
@@ -236,10 +236,16 @@ export async function search(body: SearchRequestInput): Promise<Document[]> {
 // =========================================
 
 export async function creditUsage(): Promise<{ remaining_credits: number }> {
-    return (await request(TEST_URL)
-        .get("/v1/team/credit-usage")
-        .set("Authorization", `Bearer ${process.env.TEST_API_KEY}`)
-        .set("Content-Type", "application/json")).body.data;
+    const req = (await request(TEST_URL)
+    .get("/v1/team/credit-usage")
+    .set("Authorization", `Bearer ${process.env.TEST_API_KEY}`)
+    .set("Content-Type", "application/json"));
+
+    if (req.status !== 200) {
+        throw req.body;
+    }
+
+    return req.body.data;
 }
 
 export async function tokenUsage(): Promise<{ remaining_tokens: number }> {
