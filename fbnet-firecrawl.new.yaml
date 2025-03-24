@@ -16,6 +16,7 @@ services:
       - fbnet
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    container_name: playwright-service
     restart: unless-stopped
 
   api:
@@ -51,6 +52,7 @@ services:
     ports:
       - "3005:6001"
     command: [ "pnpm", "run", "start:production" ]
+    container_name: firecrawl-api
     restart: unless-stopped
 
   worker:
@@ -85,6 +87,7 @@ services:
       - playwright-service
       - api
     command: [ "pnpm", "run", "workers" ]
+    container_name: firecrawl-worker
     restart: unless-stopped
 
   redis:
@@ -92,6 +95,7 @@ services:
     networks:
       - fbnet
     command: redis-server --bind 0.0.0.0
+    container_name: firecrawl-redis
     restart: unless-stopped
 
 networks:

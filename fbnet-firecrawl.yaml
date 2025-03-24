@@ -2,7 +2,7 @@ name: fbnet-firecrawl
 
 services:
   playwright-service:
-    build: apps/playwright-service
+    build: apps/playwright-service-ts
     environment:
       - PORT=6000
     networks:
