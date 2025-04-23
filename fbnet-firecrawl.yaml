@@ -1,4 +1,4 @@
-name: fbnet-firecrawl
+name: fbnet-tools-firecrawl
 
 x-common-service: &common-service
   build: apps/api
@@ -16,7 +16,7 @@ services:
       - fbnet
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    container_name: playwright-service
+    container_name: firecrawl-playwright-service
     restart: unless-stopped
 
   api:
@@ -35,7 +35,7 @@ services:
       LLAMAPARSE_API_KEY: ${LLAMAPARSE_API_KEY}
       LOGTAIL_KEY: ${LOGTAIL_KEY}
       BULL_AUTH_KEY: ${BULL_AUTH_KEY}
-      TEST_API_KEY: ${TEST_API_KEY}
+      TEST_API_KEY: ${TEST_API_KEY} 
       POSTHOG_API_KEY: ${POSTHOG_API_KEY}
       POSTHOG_HOST: ${POSTHOG_HOST}
       SUPABASE_ANON_TOKEN: ${SUPABASE_ANON_TOKEN}
