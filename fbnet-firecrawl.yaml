@@ -1,104 +1,104 @@
-name: fbnet-tools-firecrawl
+name: fbnet-tools-firecrawl # Nome revertido conforme solicitado
 
+# Definições comuns para os serviços da API e Worker
 x-common-service: &common-service
+  # Descomente 'build' e comente 'image' se quiser construir localmente
+  # image: ghcr.io/mendableai/firecrawl
   build: apps/api
+  ulimits: # Adicionado do template
+    nofile:
+      soft: 65535
+      hard: 65535
   networks:
-    - fbnet
+    - fbnet # Usando a rede externa fbnet
   extra_hosts:
     - "host.docker.internal:host-gateway"
+  restart: unless-stopped # Movido para cá para evitar repetição
+
+# Definições comuns de variáveis de ambiente
+x-common-env: &common-env
+  REDIS_URL: ${REDIS_URL:-redis://firecrawl-redis:6379} # Aponta para o redis local deste compose
+  REDIS_RATE_LIMIT_URL: ${REDIS_RATE_LIMIT_URL:-redis://firecrawl-redis:6379} # Aponta para o redis local
+  PLAYWRIGHT_MICROSERVICE_URL: ${PLAYWRIGHT_MICROSERVICE_URL:-http://firecrawl-playwright-service:3000/scrape} # URL atualizada (porta 3000 e /scrape)
+  USE_DB_AUTHENTICATION: ${USE_DB_AUTHENTICATION}
+  OPENAI_API_KEY: ${OPENAI_API_KEY}
+  OPENAI_BASE_URL: ${OPENAI_BASE_URL}
+  MODEL_NAME: ${MODEL_NAME:-gpt-4o} # Mantido do original, template não especificava default
+  MODEL_EMBEDDING_NAME: ${MODEL_EMBEDDING_NAME} # Adicionado do template
+  OLLAMA_BASE_URL: ${OLLAMA_BASE_URL} # Adicionado do template
+  SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
+  BULL_AUTH_KEY: ${BULL_AUTH_KEY}
+  TEST_API_KEY: ${TEST_API_KEY}
+  POSTHOG_API_KEY: ${POSTHOG_API_KEY}
+  POSTHOG_HOST: ${POSTHOG_HOST}
+  SUPABASE_ANON_TOKEN: ${SUPABASE_ANON_TOKEN}
+  SUPABASE_URL: ${SUPABASE_URL}
+  SUPABASE_SERVICE_TOKEN: ${SUPABASE_SERVICE_TOKEN}
+  SELF_HOSTED_WEBHOOK_URL: ${SELF_HOSTED_WEBHOOK_URL}
+  SERPER_API_KEY: ${SERPER_API_KEY} # Adicionado do template
+  SEARCHAPI_API_KEY: ${SEARCHAPI_API_KEY} # Adicionado do template
+  LOGGING_LEVEL: ${LOGGING_LEVEL:-info} # Adicionado default
+  PROXY_SERVER: ${PROXY_SERVER} # Adicionado do template
+  PROXY_USERNAME: ${PROXY_USERNAME} # Adicionado do template
+  PROXY_PASSWORD: ${PROXY_PASSWORD} # Adicionado do template
+  SEARXNG_ENDPOINT: ${SEARXNG_ENDPOINT} # Adicionado do template
+  SEARXNG_ENGINES: ${SEARXNG_ENGINES} # Adicionado do template
+  SEARXNG_CATEGORIES: ${SEARXNG_CATEGORIES} # Adicionado do template
+  # Variáveis removidas que não estavam no template: LLAMAPARSE_API_KEY, LOGTAIL_KEY, SCRAPING_BEE_API_KEY
 
 services:
   playwright-service:
     build: apps/playwright-service-ts
     environment:
-      - PORT=6000
+      PORT: 3000 # Porta interna atualizada para 3000
+      PROXY_SERVER: ${PROXY_SERVER} # Adicionado do template
+      PROXY_USERNAME: ${PROXY_USERNAME} # Adicionado do template
+      PROXY_PASSWORD: ${PROXY_PASSWORD} # Adicionado do template
+      BLOCK_MEDIA: ${BLOCK_MEDIA} # Adicionado do template
     networks:
-      - fbnet
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    container_name: firecrawl-playwright-service
+      - fbnet # Usando a rede externa fbnet
+    container_name: firecrawl-playwright-service # Nome mantido
     restart: unless-stopped
 
   api:
     <<: *common-service
     environment:
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
-      REDIS_RATE_LIMIT_URL: ${REDIS_URL:-redis://redis:6379}
-      PLAYWRIGHT_MICROSERVICE_URL: ${PLAYWRIGHT_MICROSERVICE_URL:-http://playwright-service:6000/html}
-      USE_DB_AUTHENTICATION: ${USE_DB_AUTHENTICATION}
-      PORT: ${PORT:-6001}
-      NUM_WORKERS_PER_QUEUE: ${NUM_WORKERS_PER_QUEUE}
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
-      OPENAI_BASE_URL: ${OPENAI_BASE_URL}
-      MODEL_NAME: ${MODEL_NAME:-gpt-4o}
-      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
-      LLAMAPARSE_API_KEY: ${LLAMAPARSE_API_KEY}
-      LOGTAIL_KEY: ${LOGTAIL_KEY}
-      BULL_AUTH_KEY: ${BULL_AUTH_KEY}
-      TEST_API_KEY: ${TEST_API_KEY} 
-      POSTHOG_API_KEY: ${POSTHOG_API_KEY}
-      POSTHOG_HOST: ${POSTHOG_HOST}
-      SUPABASE_ANON_TOKEN: ${SUPABASE_ANON_TOKEN}
-      SUPABASE_URL: ${SUPABASE_URL}
-      SUPABASE_SERVICE_TOKEN: ${SUPABASE_SERVICE_TOKEN}
-      SCRAPING_BEE_API_KEY: ${SCRAPING_BEE_API_KEY}
-      HOST: ${HOST:-0.0.0.0}
-      SELF_HOSTED_WEBHOOK_URL: ${SELF_HOSTED_WEBHOOK_URL}
-      LOGGING_LEVEL: ${LOGGING_LEVEL}
-      FLY_PROCESS_GROUP: app
+      <<: *common-env
+      HOST: "0.0.0.0" # Adicionado do template
+      PORT: ${INTERNAL_PORT:-3002} # Porta interna atualizada para 3002
+      FLY_PROCESS_GROUP: app # Adicionado do template
     depends_on:
-      - redis
+      - redis # Renomeado para corresponder ao nome do serviço abaixo
       - playwright-service
     ports:
-      - "3005:6001"
+      # Porta do host mantida como 3005 (livre) e mapeada para a nova porta interna 3002
+      - "${PORT:-3005}:${INTERNAL_PORT:-3002}"
     command: [ "pnpm", "run", "start:production" ]
-    container_name: firecrawl-api
-    restart: unless-stopped
+    container_name: firecrawl-api # Nome mantido
 
   worker:
     <<: *common-service
     environment:
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
-      REDIS_RATE_LIMIT_URL: ${REDIS_URL:-redis://redis:6379}
-      PLAYWRIGHT_MICROSERVICE_URL: ${PLAYWRIGHT_MICROSERVICE_URL:-http://playwright-service:3000}
-      USE_DB_AUTHENTICATION: ${USE_DB_AUTHENTICATION}
-      PORT: ${PORT:-3002}
-      NUM_WORKERS_PER_QUEUE: ${NUM_WORKERS_PER_QUEUE}
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
-      OPENAI_BASE_URL: ${OPENAI_BASE_URL}
-      MODEL_NAME: ${MODEL_NAME:-gpt-4o}
-      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
-      LLAMAPARSE_API_KEY: ${LLAMAPARSE_API_KEY}
-      LOGTAIL_KEY: ${LOGTAIL_KEY}
-      BULL_AUTH_KEY: ${BULL_AUTH_KEY}
-      TEST_API_KEY: ${TEST_API_KEY}
-      POSTHOG_API_KEY: ${POSTHOG_API_KEY}
-      POSTHOG_HOST: ${POSTHOG_HOST}
-      SUPABASE_ANON_TOKEN: ${SUPABASE_ANON_TOKEN}
-      SUPABASE_URL: ${SUPABASE_URL}
-      SUPABASE_SERVICE_TOKEN: ${SUPABASE_SERVICE_TOKEN}
-      SCRAPING_BEE_API_KEY: ${SCRAPING_BEE_API_KEY}
-      HOST: ${HOST:-0.0.0.0}
-      SELF_HOSTED_WEBHOOK_URL: ${SELF_HOSTED_WEBHOOK_URL}
-      LOGGING_LEVEL: ${LOGGING_LEVEL}
-      FLY_PROCESS_GROUP: worker
+      <<: *common-env
+      FLY_PROCESS_GROUP: worker # Adicionado do template
+      # PORT e HOST não são mais necessários aqui, herdados de common-env/defaults
+      NUM_WORKERS_PER_QUEUE: ${NUM_WORKERS_PER_QUEUE} # Mantido do original
     depends_on:
-      - redis
+      - redis # Renomeado para corresponder ao nome do serviço abaixo
       - playwright-service
       - api
     command: [ "pnpm", "run", "workers" ]
-    container_name: firecrawl-worker0
-    restart: unless-stopped
+    container_name: firecrawl-worker0 # Nome mantido
 
-  redis:
+  redis: # Serviço mantido conforme decisão
     image: redis:alpine
     networks:
-      - fbnet
+      - fbnet # Usando a rede externa fbnet
     command: redis-server --bind 0.0.0.0
-    container_name: firecrawl-redis
+    container_name: firecrawl-redis # Nome mantido
     restart: unless-stopped
 
 networks:
-  fbnet:
+  fbnet: # Definindo a rede externa
     driver: bridge
     external: true
