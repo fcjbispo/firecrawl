@@ -1,10 +1,9 @@
-import { MapDocument, URLTrace } from "../../controllers/v1/types";
+import { MapDocument, TeamFlags, URLTrace } from "../../controllers/v1/types";
 import { performRanking } from "../ranker";
 import { isUrlBlocked } from "../../scraper/WebScraper/utils/blocklist";
 import { logger } from "../logger";
 import { CohereClient } from "cohere-ai";
 import { extractConfig } from "./config";
-import { searchSimilarPages } from "./index/pinecone";
 import { generateCompletions } from "../../scraper/scrapeURL/transformers/llmExtract";
 import { buildRerankerUserPrompt } from "./build-prompts";
 import { buildRerankerSystemPrompt } from "./build-prompts";
@@ -57,6 +56,8 @@ export async function rerankLinks(
   mappedLinks: MapDocument[],
   searchQuery: string,
   urlTraces: URLTrace[],
+  flags: TeamFlags,
+  metadata: { teamId: string, extractId?: string }
 ): Promise<MapDocument[]> {
   // console.log("Going to rerank links");
   const mappedLinksRerank = mappedLinks.map(
@@ -67,6 +68,7 @@ export async function rerankLinks(
     mappedLinksRerank,
     mappedLinks.map((l) => l.url),
     searchQuery,
+    metadata,
   );
 
   // First try with high threshold
@@ -74,6 +76,7 @@ export async function rerankLinks(
     mappedLinks,
     linksAndScores,
     extractConfig.RERANKING.INITIAL_SCORE_THRESHOLD_FOR_RELEVANCE,
+    flags,
   );
 
   // If we don't have enough high-quality links, try with lower threshold
@@ -85,6 +88,7 @@ export async function rerankLinks(
       mappedLinks,
       linksAndScores,
       extractConfig.RERANKING.FALLBACK_SCORE_THRESHOLD_FOR_RELEVANCE,
+      flags,
     );
 
     if (filteredLinks.length === 0) {
@@ -98,7 +102,7 @@ export async function rerankLinks(
         .map((x) => mappedLinks.find((link) => link.url === x.link))
         .filter(
           (x): x is MapDocument =>
-            x !== undefined && x.url !== undefined && !isUrlBlocked(x.url),
+            x !== undefined && x.url !== undefined && !isUrlBlocked(x.url, flags),
         );
     }
   }
@@ -154,13 +158,14 @@ function filterAndProcessLinks(
     originalIndex: number;
   }[],
   threshold: number,
+  flags: TeamFlags,
 ): MapDocument[] {
   return linksAndScores
     .filter((x) => x.score > threshold)
     .map((x) => mappedLinks.find((link) => link.url === x.link))
     .filter(
       (x): x is MapDocument =>
-        x !== undefined && x.url !== undefined && !isUrlBlocked(x.url),
+        x !== undefined && x.url !== undefined && !isUrlBlocked(x.url, flags),
     );
 }
 
@@ -179,6 +184,7 @@ export type RerankerOptions = {
   multiEntityKeys: string[];
   keyIndicators: string[];
   costTracking: CostTracking;
+  metadata: { teamId: string, functionId?: string, extractId?: string };
 };
 
 export async function rerankLinksWithLLM(
@@ -192,6 +198,7 @@ export async function rerankLinksWithLLM(
     reasoning,
     multiEntityKeys,
     keyIndicators,
+    metadata,
   } = options;
   const chunkSize = 5000;
   const chunks: MapDocument[][] = [];
@@ -295,8 +302,8 @@ export async function rerankLinksWithLLM(
           let completion: any;
           try {
             const completionPromise = generateCompletions({
-              model: getModel("gemini-2.5-pro-preview-03-25", "vertex"),
-              retryModel: getModel("gemini-2.5-pro-preview-03-25", "google"),
+              model: getModel("gemini-2.5-pro", "vertex"),
+              retryModel: getModel("gemini-2.5-pro", "google"),
               logger: logger.child({
                 method: "rerankLinksWithLLM",
                 chunk: chunkIndex + 1,
@@ -323,6 +330,10 @@ export async function rerankLinksWithLLM(
                   module: "extract",
                   method: "rerankLinksWithLLM",
                 },
+              },
+              metadata: {
+                ...metadata,
+                functionId: metadata.functionId ? (metadata.functionId + "/rerankLinksWithLLM") : "rerankLinksWithLLM",
               },
             });
 

@@ -7,10 +7,10 @@ import cors from "cors";
 import {
   getExtractQueue,
   getScrapeQueue,
-  getIndexQueue,
   getGenerateLlmsTxtQueue,
   getDeepResearchQueue,
   getBillingQueue,
+  getPrecrawlQueue,
 } from "./services/queue-service";
 import { v0Router } from "./routes/v0";
 import os from "os";
@@ -18,27 +18,37 @@ import { logger } from "./lib/logger";
 import { adminRouter } from "./routes/admin";
 import http from "node:http";
 import https from "node:https";
-import CacheableLookup from "cacheable-lookup";
 import { v1Router } from "./routes/v1";
 import expressWs from "express-ws";
-import { ErrorResponse, ResponseWithSentry } from "./controllers/v1/types";
+import { ErrorResponse, RequestWithMaybeACUC, ResponseWithSentry } from "./controllers/v1/types";
 import { ZodError } from "zod";
 import { v4 as uuidv4 } from "uuid";
 import { RateLimiterMode } from "./types";
 import { attachWsProxy } from "./services/agentLivecastWS";
+import { cacheableLookup } from "./scraper/scrapeURL/lib/cacheableLookup";
+import domainFrequencyRouter from "./routes/domain-frequency";
+import { NodeSDK } from "@opentelemetry/sdk-node";
+import { LangfuseExporter } from "langfuse-vercel";
+import { getNodeAutoInstrumentations } from "@opentelemetry/auto-instrumentations-node";
 
 const { createBullBoard } = require("@bull-board/api");
-const { BullAdapter } = require("@bull-board/api/bullAdapter");
+const { BullMQAdapter } = require('@bull-board/api/bullMQAdapter');
 const { ExpressAdapter } = require("@bull-board/express");
 
 const numCPUs = process.env.ENV === "local" ? 2 : os.cpus().length;
 logger.info(`Number of CPUs: ${numCPUs} available`);
 
-const cacheable = new CacheableLookup();
-
 // Install cacheable lookup for all other requests
-cacheable.install(http.globalAgent);
-cacheable.install(https.globalAgent);
+cacheableLookup.install(http.globalAgent);
+cacheableLookup.install(https.globalAgent);
+
+const langfuseOtel = process.env.LANGFUSE_PUBLIC_KEY ? new NodeSDK({
+  traceExporter: new LangfuseExporter(),
+  instrumentations: [getNodeAutoInstrumentations()]
+}) : null;
+if (langfuseOtel) {
+  langfuseOtel.start();
+}
 
 // Initialize Express with WebSocket support
 const expressApp = express();
@@ -57,12 +67,12 @@ serverAdapter.setBasePath(`/admin/${process.env.BULL_AUTH_KEY}/queues`);
 
 const { addQueue, removeQueue, setQueues, replaceQueues } = createBullBoard({
   queues: [
-    new BullAdapter(getScrapeQueue()),
-    new BullAdapter(getExtractQueue()),
-    new BullAdapter(getIndexQueue()),
-    new BullAdapter(getGenerateLlmsTxtQueue()),
-    new BullAdapter(getDeepResearchQueue()),
-    new BullAdapter(getBillingQueue()),
+    new BullMQAdapter(getScrapeQueue()),
+    new BullMQAdapter(getExtractQueue()),
+    new BullMQAdapter(getGenerateLlmsTxtQueue()),
+    new BullMQAdapter(getDeepResearchQueue()),
+    new BullMQAdapter(getBillingQueue()),
+    new BullMQAdapter(getPrecrawlQueue()),
   ],
   serverAdapter: serverAdapter,
 });
@@ -85,6 +95,7 @@ app.get("/test", async (req, res) => {
 app.use(v0Router);
 app.use("/v1", v1Router);
 app.use(adminRouter);
+app.use(domainFrequencyRouter);
 
 const DEFAULT_PORT = process.env.PORT ?? 3002;
 const HOST = process.env.HOST ?? "localhost";
@@ -97,11 +108,22 @@ function startServer(port = DEFAULT_PORT) {
     logger.info(`Worker ${process.pid} listening on port ${port}`);
   });
 
-  const exitHandler = () => {
+  const exitHandler = async () => {
     logger.info("SIGTERM signal received: closing HTTP server");
+    if (process.env.IS_KUBERNETES === "true") {
+      // Account for GCE load balancer drain timeout
+      logger.info("Waiting 60s for GCE load balancer drain timeout");
+      await new Promise((resolve) => setTimeout(resolve, 60000));
+    }
     server.close(() => {
       logger.info("Server closed.");
-      process.exit(0);
+      if (langfuseOtel) {
+        langfuseOtel.shutdown().then(() => {
+          process.exit(0);
+        });
+      } else {
+        process.exit(0);
+      }
     });
   };
 
@@ -218,7 +240,7 @@ Sentry.setupExpressErrorHandler(app);
 app.use(
   (
     err: unknown,
-    req: Request<{}, ErrorResponse, undefined>,
+    req: RequestWithMaybeACUC<{}, ErrorResponse, undefined>,
     res: ResponseWithSentry<ErrorResponse>,
     next: NextFunction,
   ) => {
@@ -234,25 +256,14 @@ app.use(
     }
 
     const id = res.sentry ?? uuidv4();
-    let verbose = JSON.stringify(err);
-    if (verbose === "{}") {
-      if (err instanceof Error) {
-        verbose = JSON.stringify({
-          message: err.message,
-          name: err.name,
-          stack: err.stack,
-        });
-      }
-    }
 
     logger.error(
       "Error occurred in request! (" +
         req.path +
         ") -- ID " +
         id +
-        " -- " +
-        verbose,
-    );
+        " -- ",
+    { error: err, errorId: id, path: req.path, teamId: req.acuc?.team_id, team_id: req.acuc?.team_id });
     res.status(500).json({
       success: false,
       error:

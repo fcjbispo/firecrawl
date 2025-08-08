@@ -71,7 +71,7 @@ To use the API, you need to sign up on [Firecrawl](https://firecrawl.dev) and ge
 
 - [**Scrape**](#scraping): scrapes a URL and get its content in LLM-ready format (markdown, structured data via [LLM Extract](#llm-extraction-beta), screenshot, html)
 - [**Crawl**](#crawling): scrapes all the URLs of a web page and return content in LLM-ready format
-- [**Map**](#map-alpha): input a website and get all the website urls - extremely fast
+- [**Map**](#map): input a website and get all the website urls - extremely fast
 - [**Search**](#search): search the web and get full content from results
 - [**Extract**](#extract): get structured data from single page, multiple pages or entire websites with AI.
 
@@ -506,6 +506,7 @@ pip install firecrawl-py
 
 ```python
 from firecrawl.firecrawl import FirecrawlApp
+from firecrawl.firecrawl import ScrapeOptions
 
 app = FirecrawlApp(api_key="fc-YOUR_API_KEY")
 
@@ -520,7 +521,8 @@ print(scrape_status)
 crawl_status = app.crawl_url(
   'https://firecrawl.dev',
   limit=100,
-  scrapeOptions'={'formats': ['markdown', 'html']}
+  scrape_options=ScrapeOptions(
+    formats=["markdown", "html"],),
   poll_interval=30
 )
 print(crawl_status)

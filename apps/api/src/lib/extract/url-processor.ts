@@ -1,4 +1,4 @@
-import { MapDocument, URLTrace } from "../../controllers/v1/types";
+import { MapDocument, TeamFlags, URLTrace } from "../../controllers/v1/types";
 import { getMapResults } from "../../controllers/v1/map";
 import { removeDuplicateUrls } from "../validateUrl";
 import { isUrlBlocked } from "../../scraper/WebScraper/utils/blocklist";
@@ -11,7 +11,7 @@ import { getModel } from "../generic-ai";
 import { calculateCost } from "../../scraper/scrapeURL/transformers/llmExtract";
 import type { CostTracking } from "./extraction-service";
 
-export async function generateBasicCompletion(prompt: string, costTracking: CostTracking): Promise<{ text: string } | null> {
+export async function generateBasicCompletion(prompt: string, costTracking: CostTracking, metadata: { teamId: string, extractId?: string }): Promise<{ text: string } | null> {
   try {
     const result = await generateText({
       model: getModel("gpt-4o", "openai"),
@@ -20,6 +20,13 @@ export async function generateBasicCompletion(prompt: string, costTracking: Cost
         anthropic: {
           thinking: { type: "enabled", budgetTokens: 12000 },
         },
+      },
+      experimental_telemetry: {
+        isEnabled: true,
+        metadata: {
+          ...(metadata.extractId ? { langfuseTraceId: "extract:" + metadata.extractId, extractId: metadata.extractId } : {}),
+          teamId: metadata.teamId,
+        }
       }
     });
     costTracking.addCall({
@@ -47,6 +54,13 @@ export async function generateBasicCompletion(prompt: string, costTracking: Cost
             anthropic: {
               thinking: { type: "enabled", budgetTokens: 12000 },
             },
+          },
+          experimental_telemetry: {
+            isEnabled: true,
+            metadata: {
+            ...(metadata.extractId ? { langfuseTraceId: "extract:" + metadata.extractId, extractId: metadata.extractId } : {}),
+              teamId: metadata.teamId,
+            }
           }
         });
         costTracking.addCall({
@@ -85,6 +99,7 @@ interface ProcessUrlOptions {
   reasoning: string;
   multiEntityKeys: string[];
   keyIndicators: string[];
+  extractId?: string;
 }
 
 export async function processUrl(
@@ -93,6 +108,7 @@ export async function processUrl(
   updateExtractCallback: (links: string[]) => void,
   logger: Logger,
   costTracking: CostTracking,
+  teamFlags: TeamFlags,
 ): Promise<string[]> {
   const trace: URLTrace = {
     url: options.url,
@@ -104,7 +120,7 @@ export async function processUrl(
   urlTraces.push(trace);
 
   if (!options.url.includes("/*") && !options.allowExternalLinks) {
-    if (!isUrlBlocked(options.url)) {
+    if (!isUrlBlocked(options.url, teamFlags)) {
       trace.usedInCompletion = true;
       return [options.url];
     }
@@ -123,6 +139,7 @@ export async function processUrl(
     const res = await generateBasicCompletion(
       buildRefrasedPrompt(options.prompt, baseUrl),
       costTracking,
+      { teamId: options.teamId, extractId: options.extractId },
     );
 
     if (res) {
@@ -144,6 +161,7 @@ export async function processUrl(
       ignoreSitemap: false,
       includeMetadata: true,
       includeSubdomains: options.includeSubdomains,
+      flags: teamFlags,
     });
 
     let mappedLinks = mapResults.mapResults as MapDocument[];
@@ -181,6 +199,7 @@ export async function processUrl(
         ignoreSitemap: false,
         includeMetadata: true,
         includeSubdomains: options.includeSubdomains,
+        flags: teamFlags,
       });
 
       mappedLinks = retryMapResults.mapResults as MapDocument[];
@@ -248,6 +267,7 @@ export async function processUrl(
       const res = await generateBasicCompletion(
         buildPreRerankPrompt(rephrasedPrompt, options.schema, baseUrl),
         costTracking,
+        { teamId: options.teamId, extractId: options.extractId },
       );
 
       if (res) {
@@ -285,6 +305,11 @@ export async function processUrl(
       multiEntityKeys: options.multiEntityKeys,
       keyIndicators: options.keyIndicators,
       costTracking,
+      metadata: {
+        teamId: options.teamId,
+        functionId: "processUrl/pass1",
+        extractId: options.extractId,
+      },
     });
     mappedLinks = rerankerResult.mapDocument;
     let tokensUsed = rerankerResult.tokensUsed;
@@ -304,6 +329,11 @@ export async function processUrl(
         multiEntityKeys: options.multiEntityKeys,
         keyIndicators: options.keyIndicators,
         costTracking,
+        metadata: {
+          teamId: options.teamId,
+          functionId: "processUrl/pass2",
+          extractId: options.extractId,
+        },
       });
       mappedLinks = rerankerResult.mapDocument;
       tokensUsed += rerankerResult.tokensUsed;

@@ -50,6 +50,9 @@ export interface FirecrawlDocumentMetadata {
   sourceURL?: string;
   statusCode?: number;
   error?: string;
+  proxyUsed?: "basic" | "stealth";
+  cacheState?: "miss" | "hit";
+  cachedAt?: string;
   [key: string]: any; // Allows for additional metadata properties not explicitly defined.
 }
 
@@ -119,7 +122,10 @@ export interface CrawlScrapeOptions {
   skipTlsVerification?: boolean;
   removeBase64Images?: boolean;
   blockAds?: boolean;
-  proxy?: "basic" | "stealth";
+  proxy?: "basic" | "stealth" | "auto";
+  storeInCache?: boolean;
+  maxAge?: number;
+  parsePDF?: boolean;
 }
 
 export type Action = {
@@ -133,6 +139,7 @@ export type Action = {
 } | {
   type: "screenshot",
   fullPage?: boolean,
+  quality?: number,
 } | {
   type: "write",
   text: string,
@@ -165,9 +172,11 @@ export interface ScrapeParams<LLMSchema extends zt.ZodSchema = any, ActionsSchem
     prompt?: string;
     schema?: any;
     modes?: ("json" | "git-diff")[];
+    tag?: string | null;
   }
   actions?: ActionsSchema;
   agent?: AgentOptions;
+  zeroDataRetention?: boolean;
 }
 
 export interface ActionsResult {
@@ -203,6 +212,7 @@ export interface CrawlParams {
   maxDiscoveryDepth?: number;
   limit?: number;
   allowBackwardLinks?: boolean;
+  crawlEntireDomain?: boolean;
   allowExternalLinks?: boolean;
   ignoreSitemap?: boolean;
   scrapeOptions?: CrawlScrapeOptions;
@@ -215,6 +225,14 @@ export interface CrawlParams {
   deduplicateSimilarURLs?: boolean;
   ignoreQueryParameters?: boolean;
   regexOnFullURL?: boolean;
+  /**
+   * Delay in seconds between scrapes. This helps respect website rate limits.
+   * If not provided, the crawler may use the robots.txt crawl delay if available.
+   */
+  delay?: number;
+  allowSubdomains?: boolean;
+  maxConcurrency?: number;
+  zeroDataRetention?: boolean;
 }
 
 /**
@@ -281,6 +299,7 @@ export interface MapParams {
   sitemapOnly?: boolean;
   limit?: number;
   timeout?: number;
+  useIndex?: boolean;
 }
 
 /**
@@ -516,6 +535,11 @@ export interface GenerateLLMsTextParams {
    */
   showFullText?: boolean;
   /**
+   * Whether to use cached content if available
+   * @default true
+   */
+  cache?: boolean;
+  /**
    * Experimental flag for streaming
    */
   __experimental_stream?: boolean;
@@ -550,7 +574,7 @@ export interface GenerateLLMsTextStatusResponse {
 export default class FirecrawlApp {
   public apiKey: string;
   public apiUrl: string;
-  public version: string = "1.19.1";
+  public version: string =  "1.25.1";
   
   private isCloudService(url: string): boolean {
     return url.includes('api.firecrawl.dev');
@@ -562,7 +586,7 @@ export default class FirecrawlApp {
       return packageJson.default.version;
     } catch (error) {
       console.error("Error getting version:", error);
-      return "1.19.1";
+      return  "1.25.1";
     }
   }
 
@@ -995,9 +1019,10 @@ export default class FirecrawlApp {
     idempotencyKey?: string,
     webhook?: CrawlParams["webhook"],
     ignoreInvalidURLs?: boolean,
+    maxConcurrency?: number,
   ): Promise<BatchScrapeStatusResponse | ErrorResponse> {
     const headers = this.prepareHeaders(idempotencyKey);
-    let jsonData: any = { urls, webhook, ignoreInvalidURLs, ...params, origin: `js-sdk@${this.version}` };
+    let jsonData: any = { urls, webhook, ignoreInvalidURLs, maxConcurrency, ...params, origin: `js-sdk@${this.version}` };
     if (jsonData?.extract?.schema) {
       let schema = jsonData.extract.schema;
 
@@ -1224,10 +1249,12 @@ export default class FirecrawlApp {
     try {
       if (!params?.schema) {
         jsonSchema = undefined;
-      } else if (typeof params.schema === "object" && params.schema !== null && Object.getPrototypeOf(params.schema)?.constructor?.name?.startsWith("Zod")) {
-        jsonSchema = zodToJsonSchema(params.schema as zt.ZodType);
       } else {
-        jsonSchema = params.schema;
+        try {
+          jsonSchema = zodToJsonSchema(params.schema as zt.ZodType);
+        } catch (_) {
+          jsonSchema = params.schema;
+        }
       }
     } catch (error: any) {
       throw new FirecrawlError("Invalid schema. Schema must be either a valid Zod schema or JSON schema object.", 400);
@@ -1292,10 +1319,14 @@ export default class FirecrawlApp {
     let jsonSchema: any;
 
     try {
-      if (params?.schema instanceof zt.ZodType) {
-        jsonSchema = zodToJsonSchema(params.schema);
+      if (!params?.schema) {
+        jsonSchema = undefined;
       } else {
-        jsonSchema = params?.schema;
+        try {
+          jsonSchema = zodToJsonSchema(params.schema as zt.ZodType);
+        } catch (_) {
+          jsonSchema = params.schema;
+        }
       }
     } catch (error: any) {
       throw new FirecrawlError("Invalid schema. Schema must be either a valid Zod schema or JSON schema object.", 400);
@@ -1424,33 +1455,39 @@ export default class FirecrawlApp {
     headers: AxiosRequestHeaders,
     checkInterval: number
   ): Promise<CrawlStatusResponse | ErrorResponse> {
-    try {
-      let failedTries = 0;
-      while (true) {
+    let failedTries = 0;
+    let networkRetries = 0;
+    const maxNetworkRetries = 3;
+    
+    while (true) {
+      try {
         let statusResponse: AxiosResponse = await this.getRequest(
           `${this.apiUrl}/v1/crawl/${id}`,
           headers
         );
+        
         if (statusResponse.status === 200) {
           failedTries = 0;
+          networkRetries = 0;
           let statusData = statusResponse.data;
-            if (statusData.status === "completed") {
-              if ("data" in statusData) {
-                let data = statusData.data;
-                while (typeof statusData === 'object' && 'next' in statusData) {
-                  if (data.length === 0) {
-                    break
-                  }
-                  statusResponse = await this.getRequest(statusData.next, headers);
-                  statusData = statusResponse.data;
-                  data = data.concat(statusData.data);
+          
+          if (statusData.status === "completed") {
+            if ("data" in statusData) {
+              let data = statusData.data;
+              while (typeof statusData === 'object' && 'next' in statusData) {
+                if (data.length === 0) {
+                  break
                 }
-                statusData.data = data;
-                return statusData;
-              } else {
-                throw new FirecrawlError("Crawl job completed but no data was returned", 500);
+                statusResponse = await this.getRequest(statusData.next, headers);
+                statusData = statusResponse.data;
+                data = data.concat(statusData.data);
               }
-            } else if (
+              statusData.data = data;
+              return statusData;
+            } else {
+              throw new FirecrawlError("Crawl job completed but no data was returned", 500);
+            }
+          } else if (
             ["active", "paused", "pending", "queued", "waiting", "scraping"].includes(statusData.status)
           ) {
             checkInterval = Math.max(checkInterval, 2);
@@ -1469,10 +1506,67 @@ export default class FirecrawlApp {
             this.handleError(statusResponse, "check crawl status");
           }
         }
+      } catch (error: any) {
+        if (this.isRetryableError(error) && networkRetries < maxNetworkRetries) {
+          networkRetries++;
+          const backoffDelay = Math.min(1000 * Math.pow(2, networkRetries - 1), 10000);
+          
+          await new Promise((resolve) => setTimeout(resolve, backoffDelay));
+          continue;
+        }
+        
+        throw new FirecrawlError(error, 500);
       }
-    } catch (error: any) {
-      throw new FirecrawlError(error, 500);
     }
+  }
+
+  /**
+   * Determines if an error is retryable (transient network error)
+   * @param error - The error to check
+   * @returns True if the error should be retried
+   */
+  private isRetryableError(error: any): boolean {
+    if (error instanceof AxiosError) {
+      if (!error.response) {
+        const code = error.code;
+        const message = error.message?.toLowerCase() || '';
+        
+        return (
+          code === 'ECONNRESET' ||
+          code === 'ETIMEDOUT' ||
+          code === 'ENOTFOUND' ||
+          code === 'ECONNREFUSED' ||
+          message.includes('socket hang up') ||
+          message.includes('network error') ||
+          message.includes('timeout')
+        );
+      }
+      
+      if (error.response?.status === 408 || error.response?.status === 504) {
+        return true;
+      }
+    }
+    
+    if (error && typeof error === 'object') {
+      const code = error.code;
+      const message = error.message?.toLowerCase() || '';
+      
+      if (code === 'ECONNRESET' ||
+          code === 'ETIMEDOUT' ||
+          code === 'ENOTFOUND' ||
+          code === 'ECONNREFUSED' ||
+          message.includes('socket hang up') ||
+          message.includes('network error') ||
+          message.includes('timeout')) {
+        return true;
+      }
+      
+      if (error.response?.status === 408 || error.response?.status === 504) {
+        return true;
+      }
+    }
+    
+    return false;
   }
 
   /**
@@ -1481,6 +1575,13 @@ export default class FirecrawlApp {
    * @param {string} action - The action being performed when the error occurred.
    */
   handleError(response: AxiosResponse, action: string): void {
+    if (!response) {
+      throw new FirecrawlError(
+        `No response received while trying to ${action}. This may be a network error or the server is unreachable.`,
+        0
+      );
+    }
+
     if ([400, 402, 403, 408, 409, 500].includes(response.status)) {
       const errorMessage: string =
         response.data.error || "Unknown error occurred";

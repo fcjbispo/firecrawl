@@ -32,6 +32,8 @@ import { mixSchemaObjects_F0 } from "./helpers/mix-schema-objs-f0";
 import { singleAnswerCompletion_F0 } from "./completions/singleAnswer-f0";
 import { calculateFinalResultCost_F0, estimateTotalCost_F0 } from "./usage/llm-cost-f0";
 import { SourceTracker_F0 } from "./helpers/source-tracker-f0";
+import { getACUCTeam } from "../../../controllers/auth";
+import { langfuse } from "../../../services/langfuse";
 
   
   interface ExtractServiceOptions {
@@ -77,6 +79,8 @@ import { SourceTracker_F0 } from "./helpers/source-tracker-f0";
     let singleAnswerResult: any = {};
     let totalUrlsScraped = 0;
     let sources: Record<string, string[]> = {};
+
+    const acuc = await getACUCTeam(teamId);
   
   
     const logger = _logger.child({
@@ -85,13 +89,23 @@ import { SourceTracker_F0 } from "./helpers/source-tracker-f0";
       extractId,
       teamId,
     });
+
+    langfuse.trace({
+      id: "extract:" + extractId,
+      name: "performExtraction",
+      metadata: {
+        teamId,
+        extractId,
+        model: "fire-0",
+      },
+    });
   
     // If no URLs are provided, generate URLs from the prompt
     if ((!request.urls || request.urls.length === 0) && request.prompt) {
       logger.debug("Generating URLs from prompt...", {
         prompt: request.prompt,
       });
-      const rephrasedPrompt = await generateBasicCompletion_FO(buildRephraseToSerpPrompt_F0(request.prompt));
+      const rephrasedPrompt = await generateBasicCompletion_FO(buildRephraseToSerpPrompt_F0(request.prompt), { teamId, extractId });
       const searchResults = await search({
         query:  rephrasedPrompt.replace('"', "").replace("'", ""),
         num_results: 10,
@@ -102,6 +116,24 @@ import { SourceTracker_F0 } from "./helpers/source-tracker-f0";
     if (request.urls && request.urls.length === 0) {
       logger.error("No search results found", {
         query: request.prompt,
+      });
+      logJob({
+        job_id: extractId,
+        success: false,
+        message: "No search results found",
+        num_docs: 1,
+        docs: [],
+        time_taken: (new Date().getTime() - Date.now()) / 1000,
+        team_id: teamId,
+        mode: "extract",
+        url: request.urls?.join(", ") || "",
+        scrapeOptions: request,
+        origin: request.origin ?? "api",
+        integration: request.integration,
+        num_tokens: 0,
+        tokens_billed: 0,
+        sources,
+        zeroDataRetention: false, // not supported
       });
       return {
         success: false,
@@ -158,6 +190,7 @@ import { SourceTracker_F0 } from "./helpers/source-tracker-f0";
           limit: request.limit,
           includeSubdomains: request.includeSubdomains,
           schema: request.schema,
+          extractId,
         },
         urlTraces,
         (links: string[]) => {
@@ -174,6 +207,7 @@ import { SourceTracker_F0 } from "./helpers/source-tracker-f0";
           });
         },
         logger.child({ module: "extract", method: "processUrl", url }),
+        acuc?.flags ?? null,
       ),
     );
   
@@ -186,6 +220,24 @@ import { SourceTracker_F0 } from "./helpers/source-tracker-f0";
     if (links.length === 0) {
       logger.error("0 links! Bailing.", {
         linkCount: links.length,
+      });
+      logJob({
+        job_id: extractId,
+        success: false,
+        message: "No valid URLs found to scrape",
+        num_docs: 1,
+        docs: [],
+        time_taken: (new Date().getTime() - Date.now()) / 1000,
+        team_id: teamId,
+        mode: "extract",
+        url: request.urls?.join(", ") || "",
+        scrapeOptions: request,
+        origin: request.origin ?? "api",
+        integration: request.integration,
+        num_tokens: 0,
+        tokens_billed: 0,
+        sources,
+        zeroDataRetention: false, // not supported
       });
       return {
         success: false,
@@ -211,7 +263,7 @@ import { SourceTracker_F0 } from "./helpers/source-tracker-f0";
   
     let reqSchema = request.schema;
     if (!reqSchema && request.prompt) {
-      reqSchema = await generateSchemaFromPrompt_F0(request.prompt);
+      reqSchema = await generateSchemaFromPrompt_F0(request.prompt, { teamId, extractId });
       logger.debug("Generated request schema.", {
         originalSchema: request.schema,
         schema: reqSchema,
@@ -239,7 +291,7 @@ import { SourceTracker_F0 } from "./helpers/source-tracker-f0";
       reasoning,
       keyIndicators,
       tokenUsage: schemaAnalysisTokenUsage,
-    } = await analyzeSchemaAndPrompt_F0(links, reqSchema, request.prompt ?? "");
+    } = await analyzeSchemaAndPrompt_F0(links, reqSchema, request.prompt ?? "", { teamId, extractId });
   
     logger.debug("Analyzed schema.", {
       isMultiEntity,
@@ -302,8 +354,9 @@ import { SourceTracker_F0 } from "./helpers/source-tracker-f0";
             {
               url,
               teamId,
-              origin: request.origin || "api",
+              origin: "extract",
               timeout,
+              flags: acuc?.flags ?? null,
             },
             urlTraces,
             logger.child({
@@ -382,6 +435,7 @@ import { SourceTracker_F0 } from "./helpers/source-tracker-f0";
               request.prompt ?? "",
               multiEntitySchema,
               doc,
+              { teamId, extractId, functionId: "performExtraction_F0" }
             );
   
             tokenUsage.push(shouldExtractCheckTokenUsage);
@@ -423,7 +477,7 @@ import { SourceTracker_F0 } from "./helpers/source-tracker-f0";
               ],
             });
   
-            const completionPromise = batchExtractPromise_F0(multiEntitySchema, links, request.prompt ?? "", request.systemPrompt ?? "", doc);
+            const completionPromise = batchExtractPromise_F0(multiEntitySchema, links, request.prompt ?? "", request.systemPrompt ?? "", doc, { teamId, extractId, functionId: "performExtraction_F0" });
   
             // Race between timeout and completion
             const multiEntityCompletion = (await Promise.race([
@@ -520,6 +574,24 @@ import { SourceTracker_F0 } from "./helpers/source-tracker-f0";
   
       } catch (error) {
         logger.error(`Failed to transform array to object`, { error });
+        logJob({
+          job_id: extractId,
+          success: false,
+          message: "Failed to transform array to object",
+          num_docs: 1,
+          docs: [],
+          time_taken: (new Date().getTime() - Date.now()) / 1000,
+          team_id: teamId,
+          mode: "extract",
+          url: request.urls?.join(", ") || "",
+          scrapeOptions: request,
+          origin: request.origin ?? "api",
+          integration: request.integration,
+          num_tokens: 0,
+          tokens_billed: 0,
+          sources,
+          zeroDataRetention: false, // not supported
+        });
         return {
           success: false,
           error:
@@ -564,8 +636,9 @@ import { SourceTracker_F0 } from "./helpers/source-tracker-f0";
             {
               url,
               teamId,
-              origin: request.origin || "api",
+              origin: "extract",
               timeout,
+              flags: acuc?.flags ?? null,
             },
             urlTraces,
             logger.child({
@@ -598,6 +671,25 @@ import { SourceTracker_F0 } from "./helpers/source-tracker-f0";
   
         logger.debug("Scrapes finished.", { docCount: validResults.length });
       } catch (error) {
+        logger.error("Failed to scrape documents", { error });
+        logJob({
+          job_id: extractId,
+          success: false,
+          message: "Failed to scrape documents",
+          num_docs: 1,
+          docs: [],
+          time_taken: (new Date().getTime() - Date.now()) / 1000,
+          team_id: teamId,
+          mode: "extract",
+          url: request.urls?.join(", ") || "",
+          scrapeOptions: request,
+          origin: request.origin ?? "api",
+          integration: request.integration,
+          num_tokens: 0,
+          tokens_billed: 0,
+          sources,
+          zeroDataRetention: false, // not supported
+        });
         return {
           success: false,
           error: error.message,
@@ -610,6 +702,24 @@ import { SourceTracker_F0 } from "./helpers/source-tracker-f0";
       if (docsMap.size == 0) {
         // All urls are invalid
         logger.error("All provided URLs are invalid!");
+        logJob({
+          job_id: extractId,
+          success: false,
+          message: "All provided URLs are invalid",
+          num_docs: 1,
+          docs: [],
+          time_taken: (new Date().getTime() - Date.now()) / 1000,
+          team_id: teamId,
+          mode: "extract",
+          url: request.urls?.join(", ") || "",
+          scrapeOptions: request,
+          origin: request.origin ?? "api",
+          integration: request.integration,
+          num_tokens: 0,
+          tokens_billed: 0,
+          sources,
+          zeroDataRetention: false, // not supported
+        });
         return {
           success: false,
           error:
@@ -639,7 +749,8 @@ import { SourceTracker_F0 } from "./helpers/source-tracker-f0";
         rSchema,
         links,
         prompt: request.prompt ?? "",
-        systemPrompt: request.systemPrompt ?? ""
+        systemPrompt: request.systemPrompt ?? "",
+        metadata: { teamId, extractId, functionId: "performExtraction_F0" }
       });
       logger.debug("Done generating singleAnswer completions.");
   
@@ -767,14 +878,17 @@ import { SourceTracker_F0 } from "./helpers/source-tracker-f0";
       url: request.urls?.join(", ") || "",
       scrapeOptions: request,
       origin: request.origin ?? "api",
+      integration: request.integration,
       num_tokens: totalTokensUsed,
       tokens_billed: tokensToBill,
       sources,
+      zeroDataRetention: false, // not supported
     }).then(() => {
       updateExtract(extractId, {
         status: "completed",
         llmUsage,
         sources,
+        tokensBilled: tokensToBill,
       }).catch((error) => {
         logger.error(
           `Failed to update extract ${extractId} status to completed: ${error}`,

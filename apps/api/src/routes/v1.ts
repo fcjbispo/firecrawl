@@ -29,17 +29,22 @@ import { extractStatusController } from "../controllers/v1/extract-status";
 import { creditUsageController } from "../controllers/v1/credit-usage";
 import { BLOCKLISTED_URL_MESSAGE } from "../lib/strings";
 import { searchController } from "../controllers/v1/search";
+import { x402SearchController } from "../controllers/v1/x402-search";
 import { crawlErrorsController } from "../controllers/v1/crawl-errors";
 import { generateLLMsTextController } from "../controllers/v1/generate-llmstxt";
 import { generateLLMsTextStatusController } from "../controllers/v1/generate-llmstxt-status";
 import { deepResearchController } from "../controllers/v1/deep-research";
 import { deepResearchStatusController } from "../controllers/v1/deep-research-status";
 import { tokenUsageController } from "../controllers/v1/token-usage";
+import { ongoingCrawlsController } from "../controllers/v1/crawl-ongoing";
+import { addDomainFrequencyJob } from "../services"
+import { paymentMiddleware } from "x402-express";
 
 function checkCreditsMiddleware(
-  minimum?: number,
+  _minimum?: number,
 ): (req: RequestWithAuth, res: Response, next: NextFunction) => void {
   return (req, res, next) => {
+    let minimum = _minimum;
     (async () => {
       if (!minimum && req.body) {
         minimum =
@@ -90,19 +95,32 @@ function checkCreditsMiddleware(
 }
 
 export function authMiddleware(
-  rateLimiterMode: RateLimiterMode,
+  rateLimiterMode: RateLimiterMode
 ): (req: RequestWithMaybeAuth, res: Response, next: NextFunction) => void {
   return (req, res, next) => {
     (async () => {
-      if (rateLimiterMode === RateLimiterMode.Extract && isAgentExtractModelValid((req.body as any)?.agent?.model)) {
-        rateLimiterMode = RateLimiterMode.ExtractAgentPreview;
+      let currentRateLimiterMode = rateLimiterMode;
+      if (currentRateLimiterMode === RateLimiterMode.Extract && isAgentExtractModelValid((req.body as any)?.agent?.model)) {
+        currentRateLimiterMode = RateLimiterMode.ExtractAgentPreview;
       }
 
-      // if (rateLimiterMode === RateLimiterMode.Scrape && isAgentExtractModelValid((req.body as any)?.agent?.model)) {
-      //   rateLimiterMode = RateLimiterMode.ScrapeAgentPreview;
+    // Track domain frequency regardless of caching
+    try {
+      // Use the URL from the request body if available
+      const urlToTrack = (req.body as any)?.url;
+      if (urlToTrack) {
+        await addDomainFrequencyJob(urlToTrack);
+      }
+    } catch (error) {
+      // Log error without meta.logger since it's not available in this context
+      logger.warn("Failed to track domain frequency", { error });
+    }
+
+      // if (currentRateLimiterMode === RateLimiterMode.Scrape && isAgentExtractModelValid((req.body as any)?.agent?.model)) {
+      //   currentRateLimiterMode = RateLimiterMode.ScrapeAgentPreview;
       // }
 
-      const auth = await authenticateUser(req, res, rateLimiterMode);
+      const auth = await authenticateUser(req, res, currentRateLimiterMode);
 
       if (!auth.success) {
         if (!res.headersSent) {
@@ -147,8 +165,8 @@ function idempotencyMiddleware(
   })().catch((err) => next(err));
 }
 
-function blocklistMiddleware(req: Request, res: Response, next: NextFunction) {
-  if (typeof req.body.url === "string" && isUrlBlocked(req.body.url)) {
+function blocklistMiddleware(req: RequestWithACUC<any, any, any>, res: Response, next: NextFunction) {
+  if (typeof req.body.url === "string" && isUrlBlocked(req.body.url, req.acuc?.flags ?? null)) {
     if (!res.headersSent) {
       return res.status(403).json({
         success: false,
@@ -170,6 +188,26 @@ export function wrap(
 expressWs(express());
 
 export const v1Router = express.Router();
+
+// Configure payment middleware to enable micropayment-protected endpoints
+// This middleware handles payment verification and processing for premium API features
+// x402 payments protocol - https://github.com/coinbase/x402
+v1Router.use(
+  paymentMiddleware(
+    process.env.X402_PAY_TO_ADDRESS as `0x${string}` || "0x0000000000000000000000000000000000000000",
+    {
+      "POST /x402/search": {
+        price: process.env.X402_ENDPOINT_PRICE_USD as string,
+        network: process.env.X402_NETWORK as "base-sepolia" | "base" | "avalanche-fuji" | "avalanche" | "iotex",
+        config: {
+          description: "The search endpoint combines web search (SERP) with Firecrawl's scraping capabilities to return full page content for any query. Requires micropayment via X402 protocol",
+          mimeType: "application/json",
+          maxTimeoutSeconds: 120,
+        }
+      },
+    },
+  ),
+);
 
 v1Router.post(
   "/scrape",
@@ -210,6 +248,19 @@ v1Router.post(
   checkCreditsMiddleware(1),
   blocklistMiddleware,
   wrap(mapController),
+);
+
+v1Router.get(
+  "/crawl/ongoing",
+  authMiddleware(RateLimiterMode.CrawlStatus),
+  wrap(ongoingCrawlsController),
+);
+
+// Public facing, same as ongoing
+v1Router.get(
+  "/crawl/active",
+  authMiddleware(RateLimiterMode.CrawlStatus),
+  wrap(ongoingCrawlsController),
 );
 
 v1Router.get(
@@ -267,6 +318,7 @@ v1Router.get(
 v1Router.post(
   "/llmstxt",
   authMiddleware(RateLimiterMode.Scrape),
+  blocklistMiddleware,
   wrap(generateLLMsTextController),
 );
 
@@ -296,6 +348,12 @@ v1Router.delete(
   authMiddleware(RateLimiterMode.CrawlStatus),
   crawlCancelController,
 );
+
+v1Router.delete(
+  "/batch/scrape/:jobId",
+  authMiddleware(RateLimiterMode.CrawlStatus),
+  crawlCancelController,
+);
 // v1Router.get("/checkJobStatus/:jobId", crawlJobStatusPreviewController);
 
 // // Auth route for key based authentication
@@ -318,4 +376,10 @@ v1Router.get(
   "/team/token-usage",
   authMiddleware(RateLimiterMode.ExtractStatus),
   wrap(tokenUsageController),
+);
+
+v1Router.post(
+  "/x402/search",
+  authMiddleware(RateLimiterMode.Search),
+  wrap(x402SearchController),
 );

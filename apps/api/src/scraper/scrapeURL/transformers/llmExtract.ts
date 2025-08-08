@@ -16,8 +16,8 @@ import {
   generateText,
   LanguageModel,
   NoObjectGeneratedError,
+  jsonSchema,
 } from "ai";
-import { jsonSchema } from "ai";
 import { getModel } from "../../../lib/generic-ai";
 import { z } from "zod";
 import fs from "fs/promises";
@@ -191,6 +191,7 @@ export function calculateCost(
     "openai/gpt-4o-mini": { input_cost: 0.15, output_cost: 0.6 },
     "openai/gpt-4o": { input_cost: 2.5, output_cost: 10 },
     "google/gemini-2.0-flash-001": { input_cost: 0.15, output_cost: 0.6 },
+    "gemini-2.0-flash": { input_cost: 0.15, output_cost: 0.6 },
     "deepseek/deepseek-r1": { input_cost: 0.55, output_cost: 2.19 },
     "google/gemini-2.0-flash-thinking-exp:free": {
       input_cost: 0.55,
@@ -200,8 +201,7 @@ export function calculateCost(
   let modelCost = modelCosts[model] || { input_cost: 0, output_cost: 0 };
   //gemini-2.5-pro-exp-03-25 pricing
   if (
-    model === "gemini-2.5-pro-exp-03-25" ||
-    model === "gemini-2.5-pro-preview-03-25"
+    model.includes("gemini-2.5-pro")
   ) {
     let inputCost = 0;
     let outputCost = 0;
@@ -236,6 +236,7 @@ export type GenerateCompletionsOptions = {
     costTracking: CostTracking;
     metadata: Record<string, any>;
   };
+  metadata: { teamId: string, functionId?: string, extractId?: string, scrapeId?: string, deepResearchId?: string, llmsTxtId?: string };
 };
 export async function generateCompletions({
   logger,
@@ -248,6 +249,7 @@ export async function generateCompletions({
   providerOptions,
   retryModel = getModel("claude-3-5-sonnet-20240620", "anthropic"),
   costTrackingOptions,
+  metadata,
 }: GenerateCompletionsOptions): Promise<{
   extract: any;
   numTokens: number;
@@ -279,6 +281,17 @@ export async function generateCompletions({
           providerOptions: {
             anthropic: {
               thinking: { type: "enabled", budgetTokens: 12000 },
+            },
+          },
+          experimental_telemetry: {
+            isEnabled: true,
+            functionId: metadata.functionId ? (metadata.functionId + "/generateText") : "generateText",
+            metadata: {
+              teamId: metadata.teamId,
+              ...(metadata.extractId ? { langfuseTraceId: "extract:" + metadata.extractId, extractId: metadata.extractId } : {}),
+              ...(metadata.scrapeId ? { langfuseTraceId: "scrape:" + metadata.scrapeId, scrapeId: metadata.scrapeId } : {}),
+              ...(metadata.deepResearchId ? { langfuseTraceId: "deepResearch:" + metadata.deepResearchId, deepResearchId: metadata.deepResearchId } : {}),
+              ...(metadata.llmsTxtId ? { langfuseTraceId: "llmsTxt:" + metadata.llmsTxtId, llmsTxtId: metadata.llmsTxtId } : {}),
             },
           },
         });
@@ -334,6 +347,17 @@ export async function generateCompletions({
                 anthropic: {
                   thinking: { type: "enabled", budgetTokens: 12000 },
                 },
+              },
+              experimental_telemetry: {
+                isEnabled: true,
+                functionId: metadata.functionId ? (metadata.functionId + "/generateText") : "generateText",
+                metadata: {
+                  teamId: metadata.teamId,
+                  ...(metadata.extractId ? { langfuseTraceId: "extract:" + metadata.extractId, extractId: metadata.extractId } : {}),
+                  ...(metadata.scrapeId ? { langfuseTraceId: "scrape:" + metadata.scrapeId, scrapeId: metadata.scrapeId } : {}),
+                  ...(metadata.deepResearchId ? { langfuseTraceId: "deepResearch:" + metadata.deepResearchId, deepResearchId: metadata.deepResearchId } : {}),
+                  ...(metadata.llmsTxtId ? { langfuseTraceId: "llmsTxt:" + metadata.llmsTxtId, llmsTxtId: metadata.llmsTxtId } : {}),
+                }
               },
             });
 
@@ -451,6 +475,17 @@ export async function generateCompletions({
                 thinking: { type: "enabled", budgetTokens: 12000 },
               },
             },
+            experimental_telemetry: {
+              isEnabled: true,
+              functionId: metadata.functionId ? (metadata.functionId + "/repairText") : "repairText",
+              metadata: {
+                teamId: metadata.teamId,
+                ...(metadata.extractId ? { langfuseTraceId: "extract:" + metadata.extractId, extractId: metadata.extractId } : {}),
+                ...(metadata.scrapeId ? { langfuseTraceId: "scrape:" + metadata.scrapeId, scrapeId: metadata.scrapeId } : {}),
+                ...(metadata.deepResearchId ? { langfuseTraceId: "deepResearch:" + metadata.deepResearchId, deepResearchId: metadata.deepResearchId } : {}),
+                ...(metadata.llmsTxtId ? { langfuseTraceId: "llmsTxt:" + metadata.llmsTxtId, llmsTxtId: metadata.llmsTxtId } : {}),
+              },
+            },
           });
 
           costTrackingOptions.costTracking.addCall({
@@ -496,6 +531,17 @@ export async function generateCompletions({
           console.error(error);
         },
       }),
+      experimental_telemetry: {
+        isEnabled: true,
+        functionId: metadata.functionId,
+        metadata: {
+          teamId: metadata.teamId,
+          ...(metadata.extractId ? { langfuseTraceId: "extract:" + metadata.extractId, extractId: metadata.extractId } : {}),
+          ...(metadata.scrapeId ? { langfuseTraceId: "scrape:" + metadata.scrapeId, scrapeId: metadata.scrapeId } : {}),
+          ...(metadata.deepResearchId ? { langfuseTraceId: "deepResearch:" + metadata.deepResearchId, deepResearchId: metadata.deepResearchId } : {}),
+          ...(metadata.llmsTxtId ? { langfuseTraceId: "llmsTxt:" + metadata.llmsTxtId, llmsTxtId: metadata.llmsTxtId } : {}),
+        }
+      }
     } satisfies Parameters<typeof generateObject>[0];
 
     // const now = new Date().getTime();
@@ -654,6 +700,11 @@ export async function performLLMExtract(
   document: Document,
 ): Promise<Document> {
   if (meta.options.formats.includes("extract")) {
+    if (meta.internalOptions.zeroDataRetention) {
+      document.warning = "JSON mode is not supported with zero data retention." + (document.warning ? " " + document.warning : "")
+      return document;
+    }
+
     // const originalOptions = meta.options.extract!;
 
     // let generationOptions = { ...originalOptions }; // Start with original options
@@ -680,14 +731,23 @@ export async function performLLMExtract(
           method: "performLLMExtract",
         },
       },
+      metadata: {
+        teamId: meta.internalOptions.teamId,
+        functionId: "performLLMExtract",
+        scrapeId: meta.id,
+      },
     };
 
     const { extractedDataArray, warning, costLimitExceededTokenUsage } =
       await extractData({
         extractOptions: generationOptions,
-        urls: [meta.url],
+        urls: [meta.rewrittenUrl ?? meta.url],
         useAgent: false,
         scrapeId: meta.id,
+        metadata: {
+          teamId: meta.internalOptions.teamId,
+          functionId: "performLLMExtract",
+        },
       });
 
     if (warning) {
@@ -761,7 +821,7 @@ export async function performLLMExtract(
     //   // if (shouldUseSmartscrape && smartscrape_prompt) {
     //   //   meta.logger.info("Triggering SmartScrape refinement...", { reason: smartscrape_reasoning, prompt: smartscrape_prompt });
     //   //   // Call the smartScrape function (which needs to be implemented/imported)
-    //   //   // const smartScrapedDocs = await smartScrape(meta.url, smartscrape_prompt);
+    //   //   // const smartScrapedDocs = await smartScrape(meta.rewrittenUrl ?? meta.url, smartscrape_prompt);
     //   //   // Process/merge smartScrapedDocs with extractedData
     //   //   // ... potentially update finalExtract ...
     //   // } else {
@@ -831,6 +891,7 @@ export async function generateSchemaFromPrompt(
   prompt: string,
   logger: Logger,
   costTracking: CostTracking,
+  metadata: { teamId: string, functionId?: string, extractId?: string, scrapeId?: string },
 ): Promise<{ extract: any }> {
   const model = getModel("gpt-4o", "openai");
   const retryModel = getModel("gpt-4o-mini", "openai");
@@ -882,6 +943,10 @@ Return a valid JSON schema object with properties that would capture the informa
             module: "scrapeURL",
             method: "generateSchemaFromPrompt",
           },
+        },
+        metadata: {
+          ...metadata,
+          functionId: metadata.functionId ? (metadata.functionId + "/generateSchemaFromPrompt") : "generateSchemaFromPrompt",
         },
       });
 

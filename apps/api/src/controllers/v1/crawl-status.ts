@@ -22,7 +22,7 @@ import { configDotenv } from "dotenv";
 import type { Job, JobState, Queue } from "bullmq";
 import { logger } from "../../lib/logger";
 import { supabase_rr_service, supabase_service } from "../../services/supabase";
-import { getConcurrencyLimitedJobs } from "../../lib/concurrency-limit";
+import { getConcurrencyLimitedJobs, getCrawlConcurrencyLimitActiveJobs } from "../../lib/concurrency-limit";
 import { getJobFromGCS } from "../../lib/gcs-jobs";
 configDotenv();
 
@@ -33,11 +33,12 @@ export type PseudoJob<T> = {
   timestamp: number,
   data: {
     scrapeOptions: any,
+    teamId?: string,
   },
   failedReason?: string,
 }
 
-export type DBJob = { docs: any, success: boolean, page_options: any, date_added: any, message: string | null }
+export type DBJob = { docs: any, success: boolean, page_options: any, date_added: any, message: string | null, team_id: string }
 
 export async function getJob(id: string): Promise<PseudoJob<any> | null> {
   const [bullJob, dbJob, gcsJob] = await Promise.all([
@@ -110,9 +111,10 @@ export async function getJobs(ids: string[]): Promise<PseudoJob<any>[]> {
       });
     }
 
+    const state = await bullJob?.getState();
     const job: PseudoJob<any> = {
       id,
-      getState: bullJob ? (() => bullJob.getState()) : (() => dbJob!.success ? "completed" : "failed"),
+      getState: bullJob ? (() => state!) : (() => dbJob!.success ? "completed" : "failed"),
       returnvalue: Array.isArray(data)
         ? data[0]
         : data,
@@ -134,15 +136,6 @@ export async function crawlStatusController(
   res: Response<CrawlStatusResponse>,
   isBatch = false,
 ) {
-  const sc = await getCrawl(req.params.jobId);
-  if (!sc) {
-    return res.status(404).json({ success: false, error: "Job not found" });
-  }
-
-  if (sc.team_id !== req.auth.team_id) {
-    return res.status(403).json({ success: false, error: "Forbidden" });
-  }
-
   const start =
     typeof req.query.skip === "string" ? parseInt(req.query.skip, 10) : 0;
   const end =
@@ -150,50 +143,225 @@ export async function crawlStatusController(
       ? start + parseInt(req.query.limit, 10) - 1
       : undefined;
 
-  let jobIDs = await getCrawlJobs(req.params.jobId);
-  let jobStatuses = await Promise.all(
-    jobIDs.map(
-      async (x) => [x, await getScrapeQueue().getJobState(x)] as const,
-    ),
-  );
+  const sc = await getCrawl(req.params.jobId);
 
-  const throttledJobsSet = await getConcurrencyLimitedJobs(req.auth.team_id);
+  let status: Exclude<CrawlStatusResponse, ErrorResponse>["status"];
+  let doneJobsLength: number;
+  let doneJobsOrder: string[];
+  let totalCount: number;
+  let creditsUsed: number;
 
-  const validJobStatuses: [string, JobState | "unknown"][] = [];
-  const validJobIDs: string[] = [];
-
-  for (const [id, status] of jobStatuses) {
-    if (throttledJobsSet.has(id)) {
-      validJobStatuses.push([id, "prioritized"]);
-      validJobIDs.push(id);
-    } else if (
-      status !== "failed" &&
-      status !== "unknown"
-    ) {
-      validJobStatuses.push([id, status]);
-      validJobIDs.push(id);
+  if (sc) {
+    if (sc.team_id !== req.auth.team_id) {
+      return res.status(403).json({ success: false, error: "Forbidden" });
     }
-  }
 
-  const status: Exclude<CrawlStatusResponse, ErrorResponse>["status"] =
-    sc.cancelled
-      ? "cancelled"
-      : validJobStatuses.every((x) => x[1] === "completed") &&
+    let jobIDs = await getCrawlJobs(req.params.jobId);
+    let jobStatuses = await Promise.all(
+      jobIDs.map(
+        async (x) => [x, await getScrapeQueue().getJobState(x)] as const,
+      ),
+    );
+
+    if (jobStatuses.filter((x) => x[1] === "unknown").length > 0 && process.env.USE_DB_AUTHENTICATION === "true") {
+      for (let rangeStart = 0; ; rangeStart += 1000) {
+        const rangeEnd = rangeStart + 1000;
+
+        const currentJobs = await supabase_service
+          .from("firecrawl_jobs")
+          .select("success, job_id")
+          .eq("crawl_id", req.params.jobId)
+          .order("date_added", { ascending: true })
+          .range(rangeStart, rangeEnd);
+
+        const rangeLength = rangeEnd - rangeStart;
+
+        if (currentJobs.error) {
+          logger.error("Error getting current jobs", { error: currentJobs.error });
+          continue;
+        }
+
+        const data = currentJobs.data ?? [];
+
+        for (const job of data) {
+          let index = jobStatuses.findIndex((x) => x[0] === job.job_id);
+          if (index !== -1) {
+            jobStatuses[index] = [job.job_id, job.success ? "completed" : "failed"];
+          } else {
+            jobStatuses.push([job.job_id, job.success ? "completed" : "failed"]);
+          }
+        }
+
+        if (data.length < rangeLength) {
+          break;
+        }
+      }
+    }
+
+    const throttledJobsSet = new Set(await getConcurrencyLimitedJobs(req.auth.team_id));
+    const activeJobsSet = new Set(await getCrawlConcurrencyLimitActiveJobs(req.params.jobId));
+
+    const validJobStatuses: [string, JobState | "unknown"][] = [];
+    const validJobIDs: string[] = [];
+
+    for (const [id, status] of jobStatuses) {
+      if (throttledJobsSet.has(id)) {
+        validJobStatuses.push([id, "prioritized"]);
+        validJobIDs.push(id);
+      } else if (status === "unknown" && activeJobsSet.has(id)) {
+        validJobStatuses.push([id, "active"]);
+        validJobIDs.push(id);
+      } else if (
+        status !== "failed" &&
+        status !== "unknown"
+      ) {
+        validJobStatuses.push([id, status]);
+        validJobIDs.push(id);
+      }
+    }
+
+    status =
+      sc.cancelled
+        ? "cancelled"
+        : validJobStatuses.every((x) => x[1] === "completed") &&
           (sc.crawlerOptions
             ? await isCrawlKickoffFinished(req.params.jobId)
             : true)
-        ? "completed"
-        : "scraping";
+          ? "completed"
+          : "scraping";
 
-  // Use validJobIDs instead of jobIDs for further processing
-  jobIDs = validJobIDs;
+    // Use validJobIDs instead of jobIDs for further processing
+    jobIDs = validJobIDs;
 
-  const doneJobsLength = await getDoneJobsOrderedLength(req.params.jobId);
-  const doneJobsOrder = await getDoneJobsOrdered(
-    req.params.jobId,
-    start,
-    end ?? -1,
-  );
+    doneJobsLength = await getDoneJobsOrderedLength(req.params.jobId);
+    doneJobsOrder = await getDoneJobsOrdered(
+      req.params.jobId,
+      start,
+      end ?? -1,
+    );
+
+    totalCount = jobIDs.length;
+
+    if (totalCount === 0 && process.env.USE_DB_AUTHENTICATION === "true") {
+      const x = await supabase_rr_service
+        .from('firecrawl_jobs')
+        .select('*', { count: 'exact', head: true })
+        .eq("crawl_id", req.params.jobId)
+        .eq("success", true)
+
+      totalCount = x.count ?? 0;
+    }
+
+    if (process.env.USE_DB_AUTHENTICATION === "true") {
+      const creditsRpc = await supabase_rr_service
+        .rpc("credits_billed_by_crawl_id_1", {
+          i_crawl_id: req.params.jobId,
+        }, { get: true });
+
+      creditsUsed = creditsRpc.data?.[0]?.credits_billed ?? (totalCount * (
+        sc.scrapeOptions?.extract
+          ? 5
+          : 1
+      ));
+    } else {
+      creditsUsed = totalCount * (
+        sc.scrapeOptions?.extract
+          ? 5
+          : 1
+      )
+    }
+  } else if (process.env.USE_DB_AUTHENTICATION === "true") {
+    const { data: crawlJobs, error: crawlJobError } = await supabase_rr_service
+      .from("firecrawl_jobs")
+      .select("*")
+      .eq("job_id", req.params.jobId)
+      .limit(1)
+      .throwOnError();
+
+    if (crawlJobError) {
+      logger.error("Error getting crawl job", { error: crawlJobError });
+      throw crawlJobError;
+    }
+
+    const crawlJob = crawlJobs[0];
+
+    if (crawlJob && crawlJob.team_id !== req.auth.team_id) {
+      return res.status(403).json({ success: false, error: "Forbidden" });
+    }
+
+    const crawlTtlHours = req.acuc?.flags?.crawlTtlHours ?? 24;
+    const crawlTtlMs = crawlTtlHours * 60 * 60 * 1000;
+
+    if (
+      crawlJob
+      && new Date().valueOf() - new Date(crawlJob.date_added).valueOf() > crawlTtlMs
+    ) {
+      return res.status(404).json({ success: false, error: "Job expired" });
+    }
+
+    const { data: scrapeJobCounts, error: scrapeJobError } = await supabase_rr_service
+      .rpc("count_jobs_of_crawl_team", { i_crawl_id: req.params.jobId, i_team_id: req.auth.team_id }, { get: true });
+
+    if (scrapeJobError || !scrapeJobCounts || scrapeJobCounts.length === 0) {
+      logger.error("Error getting scrape job count", { error: scrapeJobError });
+      throw (scrapeJobError ?? new Error("Unknown error getting scrape job count"));
+    }
+
+    const scrapeJobCount: number = scrapeJobCounts[0].count ?? 0;
+
+    if (!crawlJobs || crawlJobs.length === 0) {
+      if (scrapeJobCount === 0) {
+        return res.status(404).json({ success: false, error: "Job not found" });
+      } else {
+        status = "completed"; // fake completed to cut the losses
+      }
+    } else {
+      status = crawlJobs[0].success ? "completed" : "failed";
+    }
+    
+    doneJobsLength = scrapeJobCount!;
+    doneJobsOrder = [];
+
+    const step = 1000;
+    let i = 0;
+    while (true) {
+      const rangeStart = start + (i * step);
+      let rangeEnd = start + ((i + 1) * step);
+      if (end !== undefined) {
+        rangeEnd = Math.min(end, rangeEnd);
+      }
+
+      const currentJobs = await supabase_rr_service
+        .from("firecrawl_jobs")
+        .select("job_id")
+        .eq("crawl_id", req.params.jobId)
+        .eq("team_id", req.acuc.team_id)
+        .order("date_added", { ascending: true })
+        .range(rangeStart, rangeEnd)
+        .throwOnError();
+
+      const rangeLength = rangeEnd - rangeStart;
+
+      const data = currentJobs.data ?? [];
+
+      doneJobsOrder.push(...data.map(x => x.job_id));
+
+      if (data.length < rangeLength) {
+        break;
+      }
+
+      if (rangeEnd === end) {
+        break;
+      }
+
+      i++
+    }
+
+    totalCount = scrapeJobCount ?? 0;
+    creditsUsed = crawlJob?.credits_billed ?? totalCount;
+  } else {
+    return res.status(404).json({ success: false, error: "Job not found" });
+  }
 
   let doneJobs: PseudoJob<any>[] = [];
 
@@ -262,28 +430,12 @@ export async function crawlStatusController(
     nextURL.searchParams.set("limit", req.query.limit);
   }
 
-  let totalCount = jobIDs.length;
-
-  if (totalCount === 0 && process.env.USE_DB_AUTHENTICATION === "true") {
-    const x = await supabase_rr_service
-      .from('firecrawl_jobs')
-      .select('*', { count: 'exact', head: true })
-      .eq("crawl_id", req.params.jobId)
-      .eq("success", true)
-    
-    totalCount = x.count ?? 0;
-  }
-
   res.status(200).json({
     success: true,
     status,
     completed: doneJobsLength,
     total: totalCount,
-    creditsUsed: totalCount * (
-      sc.scrapeOptions?.extract
-        ? 5
-        : 1
-    ),
+    creditsUsed,
     expiresAt: (await getCrawlExpiry(req.params.jobId)).toISOString(),
     next:
       status !== "scraping" && start + data.length === doneJobsLength // if there's not gonna be any documents after this

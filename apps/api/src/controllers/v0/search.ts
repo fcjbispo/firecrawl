@@ -11,7 +11,8 @@ import { search } from "../../search";
 import { isUrlBlocked } from "../../scraper/WebScraper/utils/blocklist";
 import { v4 as uuidv4 } from "uuid";
 import { logger } from "../../lib/logger";
-import { getScrapeQueue, redisConnection } from "../../services/queue-service";
+import { getScrapeQueue } from "../../services/queue-service";
+import { redisEvictConnection } from "../../../src/services/redis";
 import { addScrapeJob, waitForJob } from "../../services/queue-jobs";
 import * as Sentry from "@sentry/node";
 import { getJobPriority } from "../../lib/job-priority";
@@ -20,6 +21,7 @@ import {
   Document,
   fromLegacyCombo,
   fromLegacyScrapeOptions,
+  TeamFlags,
   toLegacyDocument,
 } from "../v1/types";
 import { getJobFromGCS } from "../../lib/gcs-jobs";
@@ -32,6 +34,7 @@ export async function searchHelper(
   crawlerOptions: any,
   pageOptions: PageOptions,
   searchOptions: SearchOptions,
+  flags: TeamFlags,
 ): Promise<{
   success: boolean;
   error?: string;
@@ -85,7 +88,7 @@ export async function searchHelper(
     return { success: true, data: res, returnCode: 200 };
   }
 
-  res = res.filter((r) => !isUrlBlocked(r.url));
+  res = res.filter((r) => !isUrlBlocked(r.url, flags));
   if (res.length > num_results) {
     res = res.slice(0, num_results);
   }
@@ -105,10 +108,12 @@ export async function searchHelper(
       name: uuid,
       data: {
         url,
-        mode: "single_urls",
+        mode: "single_urls" as const,
         team_id: team_id,
         scrapeOptions,
         internalOptions,
+        startTime: Date.now(),
+        zeroDataRetention: false, // not supported on v0
       },
       opts: {
         jobId: uuid,
@@ -119,7 +124,7 @@ export async function searchHelper(
 
   // TODO: addScrapeJobs
   for (const job of jobDatas) {
-    await addScrapeJob(job.data as any, {}, job.opts.jobId, job.opts.priority);
+    await addScrapeJob(job.data, {}, job.opts.jobId, job.opts.priority);
   }
 
   const docs = (
@@ -165,7 +170,11 @@ export async function searchController(req: Request, res: Response) {
     }
     const { team_id, chunk } = auth;
 
-    redisConnection.sadd("teams_using_v0", team_id)
+    if (chunk?.flags?.forceZDR) {
+      return res.status(400).json({ error: "Your team has zero data retention enabled. This is not supported on the v0 API. Please update your code to use the v1 API." });
+    }
+
+    redisEvictConnection.sadd("teams_using_v0", team_id)
       .catch(error => logger.error("Failed to add team to teams_using_v0", { error, team_id }));
     
     const crawlerOptions = req.body.crawlerOptions ?? {};
@@ -202,6 +211,7 @@ export async function searchController(req: Request, res: Response) {
       crawlerOptions,
       pageOptions,
       searchOptions,
+      chunk?.flags ?? null,
     );
     const endTime = new Date().getTime();
     const timeTakenInSeconds = (endTime - startTime) / 1000;
@@ -215,8 +225,11 @@ export async function searchController(req: Request, res: Response) {
       team_id: team_id,
       mode: "search",
       url: req.body.query,
+      scrapeOptions: fromLegacyScrapeOptions(req.body.pageOptions, undefined, 60000, team_id),
       crawlerOptions: crawlerOptions,
-      origin: origin,
+      origin,
+      integration: req.body.integration,
+      zeroDataRetention: false, // not supported
     });
     return res.status(result.returnCode).json(result);
   } catch (error) {

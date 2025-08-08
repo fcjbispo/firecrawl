@@ -1,4 +1,4 @@
-import { MapDocument, URLTrace } from "../../../controllers/v1/types";
+import { MapDocument, TeamFlags, URLTrace } from "../../../controllers/v1/types";
 import { getMapResults } from "../../../controllers/v1/map";
 import { removeDuplicateUrls } from "../../validateUrl";
 import { isUrlBlocked } from "../../../scraper/WebScraper/utils/blocklist";
@@ -9,12 +9,20 @@ import type { Logger } from "winston";
 import { generateText } from "ai";
 import { getModel } from "../../generic-ai";
 import { CostTracking } from "../extraction-service";
+import { getACUCTeam } from "../../../controllers/auth";
 
-export async function generateBasicCompletion_FO(prompt: string) {
+export async function generateBasicCompletion_FO(prompt: string, metadata: { teamId: string, extractId?: string }) {
   const { text } = await generateText({
     model: getModel("gpt-4o"),
     prompt: prompt,
-    temperature: 0
+    temperature: 0,
+    experimental_telemetry: {
+      isEnabled: true,
+      metadata: {
+        ...(metadata.extractId ? { langfuseTraceId: "extract:" + metadata.extractId, extractId: metadata.extractId } : {}),
+        teamId: metadata.teamId,
+      }
+    }
   });
   return text;
 }
@@ -27,6 +35,7 @@ interface ProcessUrlOptions {
   origin?: string;
   limit?: number;
   includeSubdomains?: boolean;
+  extractId?: string;
 }
 
 export async function processUrl_F0(
@@ -34,6 +43,7 @@ export async function processUrl_F0(
   urlTraces: URLTrace[],
   updateExtractCallback: (links: string[]) => void,
   logger: Logger,
+  teamFlags: TeamFlags,
 ): Promise<string[]> {
   const trace: URLTrace = {
     url: options.url,
@@ -45,7 +55,7 @@ export async function processUrl_F0(
   urlTraces.push(trace);
 
   if (!options.url.includes("/*") && !options.allowExternalLinks) {
-    if (!isUrlBlocked(options.url)) {
+    if (!isUrlBlocked(options.url, teamFlags)) {
       trace.usedInCompletion = true;
       return [options.url];
     }
@@ -65,6 +75,7 @@ export async function processUrl_F0(
       (
         await generateBasicCompletion_FO(
           buildRefrasedPrompt(options.prompt, baseUrl),
+          { teamId: options.teamId, extractId: options.extractId },
         )
       )
         ?.replace('"', "")
@@ -85,6 +96,7 @@ export async function processUrl_F0(
       ignoreSitemap: false,
       includeMetadata: true,
       includeSubdomains: options.includeSubdomains,
+      flags: teamFlags,
     });
 
     let mappedLinks = mapResults.mapResults as MapDocument[];
@@ -121,6 +133,7 @@ export async function processUrl_F0(
         ignoreSitemap: false,
         includeMetadata: true,
         includeSubdomains: options.includeSubdomains,
+        flags: teamFlags,
       });
 
       mappedLinks = retryMapResults.mapResults as MapDocument[];
@@ -186,6 +199,7 @@ export async function processUrl_F0(
       rephrasedPrompt =
         (await generateBasicCompletion_FO(
           buildPreRerankPrompt(rephrasedPrompt, options.schema, baseUrl),
+          { teamId: options.teamId, extractId: options.extractId },
         )) ??
         "Extract the data according to the schema: " +
           JSON.stringify(options.schema, null, 2);
@@ -212,6 +226,11 @@ export async function processUrl_F0(
       links: mappedLinks,
       searchQuery: rephrasedPrompt,
       urlTraces,
+      metadata: {
+        teamId: options.teamId,
+        functionId: "processUrl_F0",
+        extractId: options.extractId,
+      },
     }, new CostTracking());
     mappedLinks = rerankerResult.mapDocument;
     let tokensUsed = rerankerResult.tokensUsed;
@@ -226,6 +245,11 @@ export async function processUrl_F0(
         links: mappedLinks,
         searchQuery: rephrasedPrompt,
         urlTraces,
+        metadata: {
+          teamId: options.teamId,
+          functionId: "processUrl_F0",
+          extractId: options.extractId,
+        },
       }, new CostTracking());
       mappedLinks = rerankerResult.mapDocument;
       tokensUsed += rerankerResult.tokensUsed;
