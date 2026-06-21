@@ -1,43 +1,39 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Workflow: Build & Publish das imagens Firecrawl usadas pelo FBNet
 # Repo: github.com/fcjbispo/firecrawl  (fork de mendableai/firecrawl)
-# Branch alvo: fbnet-docker-firecrawl-v3
 #
-# O QUE ESTE ARQUIVO FAZ (resumo):
-# Sempre que você der `git push` na branch fbnet-docker-firecrawl-v3 (e mexer em
-# apps/api, apps/playwright-service-ts ou neste próprio workflow), o GitHub
-# aloca uma máquina (runner), clona seu repo, builda as 2 imagens e publica no
-# Docker Hub em fcjbispo/fbnet-firecrawl* com as tags :v3, :latest e :sha-<short>.
+# MODELO: "release branch"
+#   - Branch CANÔNICA de release:  fbnet-docker-firecrawl-release
+#     → build AUTOMÁTICO a cada push; publica :latest + :sha-<short>
+#   - Demais branches (ex.: fbnet-docker-firecrawl-v4): build MANUAL
+#     (workflow_dispatch → escolha a branch na UI); publica :<nome-da-branch>
+#     + :sha-<short>. NUNCA toca em :latest → produção fica protegida.
+#   - Promoção: validar numa branch experimental → fast-forward da release
+#     para o commit aprovado → push dispara auto-build de :latest.
 #
-# ANATOMIA DE UM WORKFLOW (leia isto pra entender os outros que você criar):
-#   name:    nome de exibição na aba Actions do GitHub.
-#   on:      GATILHOS — eventos que disparam o workflow (push, pull_request,
-#            workflow_dispatch = botão "Run workflow" manual, schedule = cron).
-#   env:     variáveis de ambiente disponíveis em todos os steps.
-#   jobs:    unidades de trabalho que rodam em runners paralelos.
-#     runs-on: qual máquina (ubuntu-latest = Linux amd64 mantido pelo GitHub).
-#     steps:   sequência de tarefas. Cada step pode ser:
-#              - `uses: ...`  -> roda uma Action pronta (código reusável de outros)
-#              - `run: ...`  -> roda um comando shell no runner.
-#   secrets: variáveis sensíveis configuradas no GitHub (Settings → Secrets and
-#            variables → Actions). Nunca coloque senhas neste arquivo.
+# Fluxo completo documentado no CLAUDE.md deste repo (seção "Release flow").
 #
-# SECRETS QUE VOCÊ PRECISA CRIAR (no repo fcjbispo/firecrawl → Settings → Secrets):
+# ANATOMIA (resumo p/ aprendizado):
+#   on:            gatilhos (push = automático; workflow_dispatch = manual)
+#   env:           variáveis de ambiente de todos os steps
+#   jobs/steps:    sequência de tarefas; `uses:` = Action pronta, `run:` = shell
+#   secrets.X:     valores sensíveis do repo (Settings → Secrets and variables)
+#
+# SECRETS necessários:
 #   DOCKERHUB_USERNAME = fcjbispo
-#   DOCKERHUB_TOKEN    = um Access Token criado no Docker Hub
-#                        (Account Settings → Personal access tokens → Generate
-#                         new token, permissão Read & Write). NÃO use sua senha.
+#   DOCKERHUB_TOKEN    = Access Token do Docker Hub (Read & Write), NÃO a senha
 # ─────────────────────────────────────────────────────────────────────────────
 name: Build & Publish Firecrawl images
 
 on:
   push:
-    branches: [fbnet-docker-firecrawl-v3]
+    # Auto-build SOMENTE na branch de release.
+    branches: [fbnet-docker-firecrawl-release]
     paths:
       - 'apps/api/**'
       - 'apps/playwright-service-ts/**'
       - '.github/workflows/firecrawl-publish.yml'
-  workflow_dispatch: # dispara manualmente: aba Actions → Run workflow
+  workflow_dispatch: # build manual de qualquer branch (Actions → Run workflow)
 
 env:
   API_IMAGE: fcjbispo/fbnet-firecrawl
@@ -54,53 +50,60 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2) Habilita o Docker Buildx (BuildKit): permite cache e, no futuro,
-      #    multi-arch (linux/amd64,linux/arm64). O build do apps/api usa
-      #    `--mount=type=cache` no Dockerfile, que exige BuildKit.
+      # 2) Habilita Docker Buildx (BuildKit) — o Dockerfile do apps/api usa
+      #    `--mount=type=cache`, que exige BuildKit. Também viabiliza cache GHA.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 3) Autentica no Docker Hub com os secrets. O login dura só deste job.
+      # 3) Login no Docker Hub usando secrets (vale só durante este job).
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # 4) Calcula um identificador curto do commit (para a tag imutável).
-      #    GITHUB_OUTPUT é como um step passa valores para os próximos steps.
-      - name: Compute short SHA
-        id: meta
-        run: echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+      # 4) Gera as tags da imagem da API conforme a branch disparadora:
+      #      - release  -> :latest + :sha-<short>           (produção)
+      #      - qualquer outra -> :<nome-da-branch> + :sha-<short>  (experimentação)
+      #    O `enable=...` liga/desliga cada regra conforme github.ref.
+      - name: Metadata for API image
+        id: meta_api
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.API_IMAGE }}
+          tags: |
+            type=sha,format=short
+            type=ref,event=branch,enable=${{ github.ref != 'refs/heads/fbnet-docker-firecrawl-release' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/fbnet-docker-firecrawl-release' }}
 
-      # 5) Build + push da imagem da API (usada por firecrawl e firecrawl-worker).
-      #    Três tags:
-      #      :v3            — rolling, reflete o build atual da linha v3
-      #      :latest        — alias que o FBNet faz pull (Watchtower auto-pull)
-      #      :sha-<short>   — imutável, para rollback pontual se um build quebrar
-      #    Cache GHA (scope=api) acelera rebuilds subsequentes.
+      # 5) Build + push da API (usada por firecrawl e firecrawl-worker no FBNet).
+      #    tags vem do step de metadata. Cache GHA (scope=api) acelera rebuilds.
       - name: Build & push api image
         uses: docker/build-push-action@v6
         with:
           context: apps/api
           push: true
-          tags: |
-            ${{ env.API_IMAGE }}:v3
-            ${{ env.API_IMAGE }}:latest
-            ${{ env.API_IMAGE }}:sha-${{ steps.meta.outputs.short_sha }}
+          tags: ${{ steps.meta_api.outputs.tags }}
           cache-from: type=gha,scope=api
           cache-to: type=gha,mode=max,scope=api
 
-      # 6) Build + push da imagem do Playwright (scope diferente p/ não chocar
-      #    com o cache da API — GHA não permite duas gravações no mesmo scope).
+      # 6) Mesma lógica de tags para a imagem do Playwright (scope diferente
+      #    p/ não chocar o cache da API — GHA não permite 2 gravações no mesmo scope).
+      - name: Metadata for Playwright image
+        id: meta_pw
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.PW_IMAGE }}
+          tags: |
+            type=sha,format=short
+            type=ref,event=branch,enable=${{ github.ref != 'refs/heads/fbnet-docker-firecrawl-release' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/fbnet-docker-firecrawl-release' }}
+
       - name: Build & push playwright image
         uses: docker/build-push-action@v6
         with:
           context: apps/playwright-service-ts
           push: true
-          tags: |
-            ${{ env.PW_IMAGE }}:v3
-            ${{ env.PW_IMAGE }}:latest
-            ${{ env.PW_IMAGE }}:sha-${{ steps.meta.outputs.short_sha }}
+          tags: ${{ steps.meta_pw.outputs.tags }}
           cache-from: type=gha,scope=playwright
           cache-to: type=gha,mode=max,scope=playwright
