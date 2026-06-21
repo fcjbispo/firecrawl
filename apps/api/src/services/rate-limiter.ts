@@ -1,11 +1,12 @@
 import { RateLimiterRedis } from "rate-limiter-flexible";
+import { config } from "../config";
 import { RateLimiterMode } from "../types";
 import Redis from "ioredis";
 import type { AuthCreditUsageChunk } from "../controllers/v1/types";
 
-export const redisRateLimitClient = new Redis(
-  process.env.REDIS_RATE_LIMIT_URL!,
-);
+export const redisRateLimitClient = new Redis(config.REDIS_RATE_LIMIT_URL!, {
+  enableAutoPipelining: true,
+});
 
 const createRateLimiter = (keyPrefix, points) =>
   new RateLimiterRedis({
@@ -14,13 +15,6 @@ const createRateLimiter = (keyPrefix, points) =>
     points,
     duration: 60, // Duration in seconds
   });
-
-export const testSuiteRateLimiter = new RateLimiterRedis({
-  storeClient: redisRateLimitClient,
-  keyPrefix: "test-suite",
-  points: 10000,
-  duration: 60, // Duration in seconds
-});
 
 const fallbackRateLimits: AuthCreditUsageChunk["rate_limits"] = {
   crawl: 15,
@@ -33,14 +27,24 @@ const fallbackRateLimits: AuthCreditUsageChunk["rate_limits"] = {
   crawlStatus: 25000,
   extractAgentPreview: 10,
   scrapeAgentPreview: 10,
+  browser: 2,
+  browserExecute: 10,
+  account: 1000,
+  supportAsk: 3,
+  supportDocsSearch: 3,
+  research: 100,
 };
 
 export function getRateLimiter(
   mode: RateLimiterMode,
   rate_limits: AuthCreditUsageChunk["rate_limits"] | null,
 ): RateLimiterRedis {
-  return createRateLimiter(
-    `${mode}`,
-    (rate_limits?.[mode] ?? fallbackRateLimits?.[mode] ?? 500),
-  );
+  let rateLimit = rate_limits?.[mode] ?? fallbackRateLimits?.[mode] ?? 500;
+
+  if (mode === RateLimiterMode.Search || mode === RateLimiterMode.Scrape) {
+    // TEMP: Mogery
+    rateLimit = Math.max(rateLimit, 100);
+  }
+
+  return createRateLimiter(`${mode}`, rateLimit);
 }

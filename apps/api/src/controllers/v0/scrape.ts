@@ -1,19 +1,10 @@
 import { ExtractorOptions, PageOptions } from "./../../lib/entities";
 import { Request, Response } from "express";
-import {
-  billTeam,
-  checkTeamCredits,
-} from "../../services/billing/credit_billing";
+import { checkTeamCredits } from "../../services/billing/credit_billing";
 import { authenticateUser } from "../auth";
-import { RateLimiterMode } from "../../types";
-import {
-  fromLegacyCombo,
-  TeamFlags,
-  toLegacyDocument,
-  url as urlSchema,
-} from "../v1/types";
+import { RateLimiterMode, AuthResponse } from "../../types";
+import { TeamFlags, toLegacyDocument, url as urlSchema } from "../v1/types";
 import { isUrlBlocked } from "../../scraper/WebScraper/utils/blocklist"; // Import the isUrlBlocked function
-import { numTokensFromString } from "../../lib/LLM-extraction/helpers";
 import {
   defaultPageOptions,
   defaultExtractorOptions,
@@ -21,19 +12,23 @@ import {
   defaultOrigin,
 } from "../../lib/default-values";
 import { addScrapeJob, waitForJob } from "../../services/queue-jobs";
-import { getScrapeQueue } from "../../services/queue-service";
 import { redisEvictConnection } from "../../../src/services/redis";
-import { v4 as uuidv4 } from "uuid";
+import { v7 as uuidv7 } from "uuid";
 import { logger } from "../../lib/logger";
 import * as Sentry from "@sentry/node";
 import { getJobPriority } from "../../lib/job-priority";
-import { fromLegacyScrapeOptions } from "../v1/types";
 import { ZodError } from "zod";
 import { Document as V0Document } from "./../../lib/entities";
-import { BLOCKLISTED_URL_MESSAGE } from "../../lib/strings";
-import { getJobFromGCS } from "../../lib/gcs-jobs";
+import { UNSUPPORTED_SITE_MESSAGE } from "../../lib/strings";
+import { fromV0Combo } from "../v2/types";
+import { ScrapeJobTimeoutError } from "../../lib/error";
+import { scrapeQueue } from "../../services/worker/nuq-router";
+import { getErrorContactMessage } from "../../lib/deployment";
+import { logRequest } from "../../services/logging/log_job";
+import { getScrapeZDR } from "../../lib/zdr-helpers";
+import { applyAgentAuthDiscoveryHeader } from "../../lib/agent-auth-discovery";
 
-export async function scrapeHelper(
+async function scrapeHelper(
   jobId: string,
   req: Request,
   team_id: string,
@@ -42,28 +37,46 @@ export async function scrapeHelper(
   extractorOptions: ExtractorOptions,
   timeout: number,
   flags: TeamFlags,
+  apiKeyId: number | null,
 ): Promise<{
   success: boolean;
   error?: string;
   data?: V0Document | { url: string };
   returnCode: number;
 }> {
-  const url = urlSchema.parse(req.body.url);
+  let url: string;
+  try {
+    url = urlSchema.parse(req.body.url);
+  } catch (error) {
+    if (error instanceof ZodError) {
+      const errorMessage =
+        error.issues
+          .map(issue => issue.message)
+          .filter((msg, idx, arr) => arr.indexOf(msg) === idx)
+          .join("; ") || "Invalid URL";
+
+      return { success: false, error: errorMessage, returnCode: 400 };
+    }
+    throw error;
+  }
   if (typeof url !== "string") {
     return { success: false, error: "Url is required", returnCode: 400 };
   }
 
-  if (isUrlBlocked(url, flags)) {
+  if (
+    isUrlBlocked(url, flags, {
+      team_id,
+      origin: req.body?.origin ?? null,
+    })
+  ) {
     return {
       success: false,
-      error: BLOCKLISTED_URL_MESSAGE,
+      error: UNSUPPORTED_SITE_MESSAGE,
       returnCode: 403,
     };
   }
 
-  const jobPriority = await getJobPriority({ team_id, basePriority: 10 });
-
-  const { scrapeOptions, internalOptions } = fromLegacyCombo(
+  const { scrapeOptions, internalOptions } = fromV0Combo(
     pageOptions,
     extractorOptions,
     timeout,
@@ -71,7 +84,10 @@ export async function scrapeHelper(
     team_id,
   );
 
-  internalOptions.saveScrapeResultToGCS = process.env.GCS_FIRE_ENGINE_BUCKET_NAME ? true : false;
+  internalOptions.saveScrapeResultToGCS = process.env
+    .GCS_FIRE_ENGINE_BUCKET_NAME
+    ? true
+    : false;
 
   await addScrapeJob(
     {
@@ -82,27 +98,26 @@ export async function scrapeHelper(
       internalOptions,
       origin: req.body.origin ?? defaultOrigin,
       integration: req.body.integration,
-      is_scrape: true,
+      billing: { endpoint: "scrape", jobId },
       startTime: Date.now(),
       zeroDataRetention: false, // not supported on v0
+      apiKeyId,
     },
-    {},
     jobId,
-    jobPriority,
+    await getJobPriority({ team_id, basePriority: 10 }),
+    false,
+    true,
   );
 
   let doc;
 
   try {
-    doc = await waitForJob(jobId, timeout);
+    doc = await waitForJob(jobId, timeout, false);
   } catch (e) {
-    if (
-      e instanceof Error &&
-      (e.message.startsWith("Job wait") || e.message === "timeout")
-    ) {
+    if (e instanceof ScrapeJobTimeoutError) {
       return {
         success: false,
-        error: "Request timed out",
+        error: e.message,
         returnCode: 408,
       };
     } else if (
@@ -128,7 +143,7 @@ export async function scrapeHelper(
     return err;
   }
 
-  await getScrapeQueue().remove(jobId);
+  await scrapeQueue.removeJob(jobId);
 
   if (!doc) {
     console.error("!!! PANIC DOC IS", doc);
@@ -172,17 +187,48 @@ export async function scrapeController(req: Request, res: Response) {
     // make sure to authenticate user first, Bearer <token>
     const auth = await authenticateUser(req, res, RateLimiterMode.Scrape);
     if (!auth.success) {
+      if (auth.status === 401) applyAgentAuthDiscoveryHeader(res);
       return res.status(auth.status).json({ error: auth.error });
     }
 
     const { team_id, chunk } = auth;
 
-    if (chunk?.flags?.forceZDR) {
-      return res.status(400).json({ error: "Your team has zero data retention enabled. This is not supported on the v0 API. Please update your code to use the v1 API." });
+    if (getScrapeZDR(chunk?.flags) === "forced") {
+      return res.status(400).json({
+        error:
+          "Your team has zero data retention enabled. This is not supported on the v0 API. Please update your code to use the v1 API.",
+      });
     }
 
-    redisEvictConnection.sadd("teams_using_v0", team_id)
-      .catch(error => logger.error("Failed to add team to teams_using_v0", { error, team_id }));
+    const jobId = uuidv7();
+
+    await logRequest({
+      id: jobId,
+      kind: "scrape",
+      api_version: "v0",
+      team_id,
+      origin: req.body.origin ?? "api",
+      integration: req.body.integration,
+      target_hint: req.body.url ?? "",
+      zeroDataRetention: false, // not supported on v0
+      api_key_id: chunk?.api_key_id ?? null,
+    });
+
+    redisEvictConnection.sadd("teams_using_v0", team_id).catch(error =>
+      logger.error("Failed to add team to teams_using_v0", {
+        error,
+        team_id,
+      }),
+    );
+
+    redisEvictConnection
+      .sadd("teams_using_v0:" + team_id, "scrape:" + jobId)
+      .catch(error =>
+        logger.error("Failed to add team to teams_using_v0 (2)", {
+          error,
+          team_id,
+        }),
+      );
 
     const crawlerOptions = req.body.crawlerOptions ?? {};
     const pageOptions = { ...defaultPageOptions, ...req.body.pageOptions };
@@ -223,14 +269,10 @@ export async function scrapeController(req: Request, res: Response) {
       logger.error(error);
       earlyReturn = true;
       return res.status(500).json({
-        error:
-          "Error checking team credits. Please contact help@firecrawl.com for help.",
+        error: getErrorContactMessage(),
       });
     }
 
-    const jobId = uuidv4();
-
-    const startTime = new Date().getTime();
     const result = await scrapeHelper(
       jobId,
       req,
@@ -240,45 +282,8 @@ export async function scrapeController(req: Request, res: Response) {
       extractorOptions,
       timeout,
       chunk?.flags ?? null,
+      chunk?.api_key_id ?? null,
     );
-    const endTime = new Date().getTime();
-    const timeTakenInSeconds = (endTime - startTime) / 1000;
-    const numTokens =
-      result.data && (result.data as V0Document).markdown
-        ? numTokensFromString(
-            (result.data as V0Document).markdown!,
-            "gpt-3.5-turbo",
-          )
-        : 0;
-
-    if (result.success) {
-      let creditsToBeBilled = 1;
-      const creditsPerLLMExtract = 4;
-
-      if (extractorOptions.mode.includes("llm-extraction")) {
-        // creditsToBeBilled = creditsToBeBilled + (creditsPerLLMExtract * filteredDocs.length);
-        creditsToBeBilled += creditsPerLLMExtract;
-      }
-
-      let startTimeBilling = new Date().getTime();
-
-      if (earlyReturn) {
-        // Don't bill if we're early returning
-        return;
-      }
-      if (creditsToBeBilled > 0) {
-        // billing for doc done on queue end, bill only for llm extraction
-        billTeam(team_id, chunk?.sub_id, creditsToBeBilled, logger).catch(
-          (error) => {
-            logger.error(
-              `Failed to bill team ${team_id} for ${creditsToBeBilled} credits`,
-              { error },
-            );
-            // Optionally, you could notify an admin or add to a retry queue here
-          },
-        );
-      }
-    }
 
     let doc = result.data;
     if (!pageOptions || !pageOptions.includeRawHtml) {

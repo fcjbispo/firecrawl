@@ -13,7 +13,7 @@ on:
 
 jobs:
       push-app-image:
-        runs-on: ubuntu-latest
+        runs-on: blacksmith-4vcpu-ubuntu-2404
         defaults:
           run:
             working-directory: './apps/redis'
@@ -22,7 +22,7 @@ jobs:
             uses: actions/checkout@main
 
           - name: 'Login to GitHub Container Registry'
-            uses: docker/login-action@v1
+            uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
             with:
               registry: ghcr.io
               username: ${{github.actor}}
@@ -30,5 +30,5 @@ jobs:
 
           - name: 'Build Inventory Image'
             run: |
-              docker build . --tag ghcr.io/mendableai/firecrawl-redis:latest
-              docker push ghcr.io/mendableai/firecrawl-redis:latest
+              docker build . --tag ghcr.io/firecrawl/firecrawl-redis:latest
+              docker push ghcr.io/firecrawl/firecrawl-redis:latest

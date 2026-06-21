@@ -1,96 +1,156 @@
 import type { Logger } from "winston";
-import { supabase_rr_service, supabase_service } from "../services/supabase";
+import { eq, inArray, and } from "drizzle-orm";
+import { db, dbRr } from "../db/connection";
+import * as schema from "../db/schema";
 import { logger } from "./logger";
 import * as Sentry from "@sentry/node";
 
 /**
- * Get a single firecrawl_job by ID
- * @param jobId ID of Job
- * @returns {any | null} Job
+ * Get a single scrape by ID from the scrapes table
+ * @param scrapeId ID of Scrape
+ * @returns Scrape data or null
  */
-export const supabaseGetJobById = async (jobId: string) => {
-  const { data, error } = await supabase_rr_service
-    .from("firecrawl_jobs")
-    .select("*")
-    .eq("job_id", jobId)
-    .single();
-
-  if (error) {
+export const supabaseGetScrapeById = async (scrapeId: string): Promise<any> => {
+  try {
+    const [data] = await dbRr
+      .select()
+      .from(schema.scrapes)
+      .where(eq(schema.scrapes.id, scrapeId))
+      .limit(1);
+    return data ?? null;
+  } catch (error) {
     return null;
   }
-
-  if (!data) {
-    return null;
-  }
-
-  return data;
 };
 
 /**
- * Get multiple firecrawl_jobs by ID. Use this if you're not requesting a lot (50+) of jobs at once.
- * @param jobIds IDs of Jobs
- * @returns {any[]} Jobs
+ * Get multiple scrapes by ID from the scrapes table
+ * @param scrapeIds IDs of Scrapes
+ * @returns Scrape data array
  */
-export const supabaseGetJobsById = async (jobIds: string[]) => {
-  const { data, error } = await supabase_rr_service
-    .from("firecrawl_jobs")
-    .select()
-    .in("job_id", jobIds);
-
-  if (error) {
-    logger.error(`Error in supabaseGetJobsById: ${error}`);
+export const supabaseGetScrapesById = async (
+  scrapeIds: string[],
+): Promise<any[]> => {
+  try {
+    return await dbRr
+      .select()
+      .from(schema.scrapes)
+      .where(inArray(schema.scrapes.id, scrapeIds));
+  } catch (error) {
+    logger.error(`Error in supabaseGetScrapesById: ${error}`);
     Sentry.captureException(error);
     return [];
   }
-
-  if (!data) {
-    return [];
-  }
-
-  return data;
 };
 
 /**
- * Get multiple firecrawl_jobs by crawl ID. Use this if you need a lot of jobs at once.
- * @param crawlId ID of crawl
- * @returns {any[]} Jobs
+ * Get multiple scrapes by request ID (crawl/batch scrape ID) from the scrapes table
+ * @param requestId ID of the parent request (crawl or batch scrape)
+ * @returns Scrape data array
  */
-export const supabaseGetJobsByCrawlId = async (crawlId: string) => {
-  const { data, error } = await supabase_rr_service
-    .from("firecrawl_jobs")
-    .select()
-    .eq("crawl_id", crawlId);
-
-  if (error) {
-    logger.error(`Error in supabaseGetJobsByCrawlId: ${error}`);
+export const supabaseGetScrapesByRequestId = async (
+  requestId: string,
+): Promise<any[]> => {
+  try {
+    return await dbRr
+      .select()
+      .from(schema.scrapes)
+      .where(eq(schema.scrapes.request_id, requestId));
+  } catch (error) {
+    logger.error(`Error in supabaseGetScrapesByRequestId: ${error}`);
     Sentry.captureException(error);
     return [];
   }
-
-  if (!data) {
-    return [];
-  }
-
-  return data;
 };
 
-export const supabaseGetJobByIdOnlyData = async (jobId: string, logger?: Logger) => {
-  const { data, error } = await supabase_rr_service
-    .from("firecrawl_jobs")
-    .select("team_id")
-    .eq("job_id", jobId)
-    .single();
-
-  if (error) {
-    if (logger) {
-      logger.error("Error in supabaseGetJobByIdOnlyData", { error });
+/**
+ * Get only team_id from a scrape by ID (lightweight query)
+ * @param scrapeId ID of Scrape
+ * @param logger Optional logger for error reporting
+ * @returns Object with team_id or null
+ */
+export const supabaseGetScrapeByIdOnlyData = async (
+  scrapeId: string,
+  log?: Logger,
+): Promise<any> => {
+  try {
+    const [data] = await dbRr
+      .select({ team_id: schema.scrapes.team_id })
+      .from(schema.scrapes)
+      .where(eq(schema.scrapes.id, scrapeId))
+      .limit(1);
+    return data ?? null;
+  } catch (error) {
+    if (log) {
+      log.error("Error in supabaseGetScrapeByIdOnlyData", { error });
     }
     return null;
   }
+};
 
-  if (!data) {
+export const supabaseGetExtractByIdDirect = async (
+  extractId: string,
+): Promise<any> => {
+  try {
+    const [data] = await db
+      .select()
+      .from(schema.extracts)
+      .where(eq(schema.extracts.id, extractId))
+      .limit(1);
+    return data ?? null;
+  } catch (error) {
     return null;
   }
+};
 
-  return data;
+export const supabaseGetExtractRequestByIdDirect = async (
+  extractId: string,
+): Promise<any> => {
+  try {
+    const [data] = await db
+      .select()
+      .from(schema.requests)
+      .where(
+        and(
+          eq(schema.requests.id, extractId),
+          inArray(schema.requests.kind, ["extract", "agent"]),
+        ),
+      )
+      .limit(1);
+    return data ?? null;
+  } catch (error) {
+    return null;
+  }
+};
+
+export const supabaseGetAgentRequestByIdDirect = async (
+  agentId: string,
+): Promise<any> => {
+  try {
+    const [data] = await db
+      .select()
+      .from(schema.requests)
+      .where(
+        and(eq(schema.requests.id, agentId), eq(schema.requests.kind, "agent")),
+      )
+      .limit(1);
+    return data ?? null;
+  } catch (error) {
+    return null;
+  }
+};
+
+export const supabaseGetAgentByIdDirect = async (
+  agentId: string,
+): Promise<any> => {
+  try {
+    const [data] = await db
+      .select()
+      .from(schema.agents)
+      .where(eq(schema.agents.id, agentId))
+      .limit(1);
+    return data ?? null;
+  } catch (error) {
+    return null;
+  }
 };

@@ -1,16 +1,29 @@
+import type { MockedFunction } from "vitest";
 import "dotenv/config";
 
-process.env.ENV = "test";
+import { config } from "../../config";
+config.ENV = "test";
 
 import { scrapeURL } from ".";
-import { scrapeOptions } from "../../controllers/v1/types";
+import { scrapeOptions } from "../../controllers/v2/types";
 import { Engine } from "./engines";
-import { CostTracking } from "../../lib/extract/extraction-service";
+import { CostTracking } from "../../lib/cost-tracking";
+
+// Mock parseMarkdown but delegate to real implementation for other tests
+vi.mock("../../lib/html-to-markdown", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../../lib/html-to-markdown")>();
+  return {
+    ...actual,
+    parseMarkdown: vi.fn(actual.parseMarkdown),
+  };
+});
+
+import { parseMarkdown } from "../../lib/html-to-markdown";
 
 const testEngines: (Engine | undefined)[] = [
   undefined,
   "fire-engine;chrome-cdp",
-  "fire-engine;playwright",
   "fire-engine;tlsclient",
   "fetch",
 ];
@@ -18,7 +31,6 @@ const testEngines: (Engine | undefined)[] = [
 const testEnginesScreenshot: (Engine | undefined)[] = [
   undefined,
   "fire-engine;chrome-cdp",
-  "fire-engine;playwright",
 ];
 
 describe("Standalone scrapeURL tests", () => {
@@ -26,7 +38,7 @@ describe("Standalone scrapeURL tests", () => {
     it("Basic scrape", async () => {
       const out = await scrapeURL(
         "test:scrape-basic",
-        "https://www.roastmywebsite.ai/",
+        "https://firecrawl-test-site.vercel.app",
         scrapeOptions.parse({}),
         { forceEngine, teamId: "test" },
         new CostTracking(),
@@ -40,30 +52,21 @@ describe("Standalone scrapeURL tests", () => {
         expect(out.document).toHaveProperty("markdown");
         expect(out.document).toHaveProperty("metadata");
         expect(out.document).not.toHaveProperty("html");
-        expect(out.document.markdown).toContain("_Roast_");
+        expect(out.document.markdown).toContain("Firecrawl Test Site");
         expect(out.document.metadata.error).toBeUndefined();
-        expect(out.document.metadata.title).toBe("Roast My Website");
+        expect(out.document.metadata.title).toBe("Firecrawl Test Website");
         expect(out.document.metadata.description).toBe(
-          "Welcome to Roast My Website, the ultimate tool for putting your website through the wringer! This repository harnesses the power of Firecrawl to scrape and capture screenshots of websites, and then unleashes the latest LLM vision models to mercilessly roast them. 🌶️",
+          "Welcome to the Firecrawl Test Website!",
         );
-        expect(out.document.metadata.keywords).toBe(
-          "Roast My Website,Roast,Website,GitHub,Firecrawl",
-        );
-        expect(out.document.metadata.robots).toBe("follow, index");
-        expect(out.document.metadata.ogTitle).toBe("Roast My Website");
+        expect(out.document.metadata.ogTitle).toBe("Firecrawl Test Website");
         expect(out.document.metadata.ogDescription).toBe(
-          "Welcome to Roast My Website, the ultimate tool for putting your website through the wringer! This repository harnesses the power of Firecrawl to scrape and capture screenshots of websites, and then unleashes the latest LLM vision models to mercilessly roast them. 🌶️",
+          "Welcome to the Firecrawl Test Website!",
         );
-        expect(out.document.metadata.ogUrl).toBe(
-          "https://www.roastmywebsite.ai",
-        );
-        expect(out.document.metadata.ogImage).toBe(
-          "https://www.roastmywebsite.ai/og.png",
-        );
+        expect(out.document.metadata.ogUrl).toContain("firecrawl-test-site");
+        expect(out.document.metadata.ogImage).toContain("firecrawl-test-site");
         expect(out.document.metadata.ogLocaleAlternate).toStrictEqual([]);
-        expect(out.document.metadata.ogSiteName).toBe("Roast My Website");
         expect(out.document.metadata.sourceURL).toBe(
-          "https://www.roastmywebsite.ai/",
+          "https://firecrawl-test-site.vercel.app",
         );
         expect(out.document.metadata.statusCode).toBe(200);
       }
@@ -72,7 +75,7 @@ describe("Standalone scrapeURL tests", () => {
     it("Scrape with formats markdown and html", async () => {
       const out = await scrapeURL(
         "test:scrape-formats-markdown-html",
-        "https://roastmywebsite.ai",
+        "https://firecrawl-test-site.vercel.app",
         scrapeOptions.parse({
           formats: ["markdown", "html"],
         }),
@@ -87,7 +90,7 @@ describe("Standalone scrapeURL tests", () => {
         expect(out.document).toHaveProperty("markdown");
         expect(out.document).toHaveProperty("html");
         expect(out.document).toHaveProperty("metadata");
-        expect(out.document.markdown).toContain("_Roast_");
+        expect(out.document.markdown).toContain("Firecrawl Test Site");
         expect(out.document.html).toContain("<h1");
         expect(out.document.metadata.statusCode).toBe(200);
         expect(out.document.metadata.error).toBeUndefined();
@@ -388,6 +391,31 @@ describe("Standalone scrapeURL tests", () => {
     }
   }, 60000);
 
+  it("Scrapes a XLSX file", async () => {
+    const out = await scrapeURL(
+      "test:scrape-xlsx",
+      "https://download.microsoft.com/download/1/4/E/14EDED28-6C58-4055-A65C-23B4DA81C4DE/Financial%20Sample.xlsx",
+      scrapeOptions.parse({}),
+      { teamId: "test" },
+      new CostTracking(),
+    );
+
+    // expect(out.logs.length).toBeGreaterThan(0);
+    expect(out.success).toBe(true);
+    if (out.success) {
+      expect(out.document.warning).toBeUndefined();
+      expect(out.document).toHaveProperty("metadata");
+      // sheet name
+      expect(out.document.markdown).toContain("Sheet1");
+      // headers
+      expect(out.document.markdown).toContain("Segment");
+      expect(out.document.markdown).toContain("Product");
+      expect(out.document.markdown).toContain("Country");
+      expect(out.document.metadata.statusCode).toBe(200);
+      expect(out.document.metadata.error).toBeUndefined();
+    }
+  }, 60000);
+
   it("LLM extract with prompt and schema", async () => {
     const out = await scrapeURL(
       "test:llm-extract-prompt-schema",
@@ -466,10 +494,16 @@ describe("Standalone scrapeURL tests", () => {
 
   test.concurrent.each(new Array(100).fill(0).map((_, i) => i))(
     "Concurrent scrape #%i",
-    async (i) => {
+    async i => {
       const url = "https://www.scrapethissite.com/?i=" + i;
       const id = "test:concurrent:" + url;
-      const out = await scrapeURL(id, url, scrapeOptions.parse({}), { teamId: "test" }, new CostTracking());
+      const out = await scrapeURL(
+        id,
+        url,
+        scrapeOptions.parse({}),
+        { teamId: "test" },
+        new CostTracking(),
+      );
 
       const replacer = (key: string, value: any) => {
         if (value instanceof Error) {
@@ -485,14 +519,6 @@ describe("Standalone scrapeURL tests", () => {
         }
       };
 
-      // verify that log collection works properly while concurrency is happening
-      // expect(out.logs.length).toBeGreaterThan(0);
-      const weirdLogs = out.logs.filter((x) => x.scrapeId !== id);
-      if (weirdLogs.length > 0) {
-        console.warn(JSON.stringify(weirdLogs, replacer));
-      }
-      expect(weirdLogs.length).toBe(0);
-
       if (!out.success) console.error(JSON.stringify(out, replacer));
       expect(out.success).toBe(true);
 
@@ -506,4 +532,35 @@ describe("Standalone scrapeURL tests", () => {
     },
     30000,
   );
+
+  it("Sitemap scrape should not convert to markdown", async () => {
+    const mockParseMarkdown = parseMarkdown as MockedFunction<
+      typeof parseMarkdown
+    >;
+    mockParseMarkdown.mockClear();
+
+    const out = await scrapeURL(
+      "test:sitemap-no-markdown",
+      "https://www.scrapethissite.com/sitemap.xml",
+      scrapeOptions.parse({
+        formats: ["rawHtml"],
+      }),
+      { teamId: "sitemap" },
+      new CostTracking(),
+    );
+
+    expect(out.success).toBe(true);
+    if (out.success) {
+      expect(out.document.warning).toBeUndefined();
+      // Verify markdown conversion was never called
+      expect(mockParseMarkdown).not.toHaveBeenCalled();
+      // Sitemap scrapes should not have markdown field
+      expect(out.document).not.toHaveProperty("markdown");
+      // But should have rawHtml
+      expect(out.document).toHaveProperty("rawHtml");
+      expect(out.document.rawHtml).toBeTruthy();
+      expect(out.document).toHaveProperty("metadata");
+      expect(out.document.metadata.error).toBeUndefined();
+    }
+  }, 30000);
 });

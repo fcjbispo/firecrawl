@@ -1,7 +1,7 @@
 import { InternalOptions } from "..";
 import { ScrapeOptions } from "../../../controllers/v1/types";
 
-export type UrlSpecificParams = {
+type UrlSpecificParams = {
   scrapeOptions: Partial<ScrapeOptions>;
   internalOptions: Partial<InternalOptions>;
 };
@@ -31,14 +31,6 @@ export const urlSpecificParams: Record<string, UrlSpecificParams> = {
   //             engine: "request",
   //         },
   //     },
-  // },
-  // "notion.com": {
-  //     scrapeOptions: { waitFor: 2000 },
-  //     internalOptions: { forceEngine: "fire-engine;playwright" }
-  // },
-  // "developer.apple.com": {
-  //     scrapeOptions: { waitFor: 2000 },
-  //     internalOptions: { forceEngine: "fire-engine;playwright" }
   // },
   "digikey.com": {
     scrapeOptions: {},

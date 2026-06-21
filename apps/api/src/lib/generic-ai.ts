@@ -1,5 +1,6 @@
 import { createOpenAI } from "@ai-sdk/openai";
-import { createOllama } from "ollama-ai-provider";
+import { config } from "../config";
+import { createOllama } from "ollama-ai-provider-v2";
 import { anthropic } from "@ai-sdk/anthropic";
 import { groq } from "@ai-sdk/groq";
 import { google } from "@ai-sdk/google";
@@ -18,53 +19,57 @@ type Provider =
   | "fireworks"
   | "deepinfra"
   | "vertex";
-const defaultProvider: Provider = process.env.OLLAMA_BASE_URL
-  ? "ollama"
-  : "openai";
+const defaultProvider: Provider = config.OLLAMA_BASE_URL ? "ollama" : "openai";
 
 const providerList: Record<Provider, any> = {
   openai: createOpenAI({
-      apiKey: process.env.OPENAI_API_KEY,
-      baseURL: process.env.OPENAI_BASE_URL,
+    apiKey: config.OPENAI_API_KEY,
+    baseURL: config.OPENAI_BASE_URL,
   }), //OPENAI_API_KEY
   ollama: createOllama({
-    baseURL: process.env.OLLAMA_BASE_URL,
+    baseURL: config.OLLAMA_BASE_URL,
   }),
   anthropic, //ANTHROPIC_API_KEY
   groq, //GROQ_API_KEY
   google, //GOOGLE_GENERATIVE_AI_API_KEY
   openrouter: createOpenRouter({
-    apiKey: process.env.OPENROUTER_API_KEY,
+    apiKey: config.OPENROUTER_API_KEY,
   }),
   fireworks, //FIREWORKS_API_KEY
   deepinfra, //DEEPINFRA_API_KEY
   vertex: createVertex({
     project: "firecrawl",
     //https://github.com/vercel/ai/issues/6644 bug
-    baseURL:"https://aiplatform.googleapis.com/v1/projects/firecrawl/locations/global/publishers/google",
+    baseURL:
+      "https://aiplatform.googleapis.com/v1/projects/firecrawl/locations/global/publishers/google",
     location: "global",
-    googleAuthOptions: process.env.VERTEX_CREDENTIALS ? {
-      credentials: JSON.parse(atob(process.env.VERTEX_CREDENTIALS)),
-    } : {
-      keyFile: "./gke-key.json",
-    },
+    googleAuthOptions: config.VERTEX_CREDENTIALS
+      ? {
+          credentials: JSON.parse(atob(config.VERTEX_CREDENTIALS)),
+        }
+      : {
+          keyFile: "./gke-key.json",
+        },
   }),
 };
 
 export function getModel(name: string, provider: Provider = defaultProvider) {
-  if(name === "gemini-2.5-pro"){
-    name = "gemini-2.5-pro"
+  if (name === "gemini-2.5-pro") {
+    name = "gemini-2.5-pro";
   }
-  return process.env.MODEL_NAME
-    ? providerList[provider](process.env.MODEL_NAME)
-    : providerList[provider](name);
+  const modelName = config.MODEL_NAME || name;
+  // o3-mini returns empty text via the Responses API — force Chat Completions
+  if (provider === "openai" && modelName.startsWith("o3-mini")) {
+    return providerList.openai.chat(modelName);
+  }
+  return providerList[provider](modelName);
 }
 
 export function getEmbeddingModel(
   name: string,
   provider: Provider = defaultProvider,
 ) {
-  return process.env.MODEL_EMBEDDING_NAME
-    ? providerList[provider].embedding(process.env.MODEL_EMBEDDING_NAME)
+  return config.MODEL_EMBEDDING_NAME
+    ? providerList[provider].embedding(config.MODEL_EMBEDDING_NAME)
     : providerList[provider].embedding(name);
 }

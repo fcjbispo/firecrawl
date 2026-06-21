@@ -4,6 +4,7 @@ metadata:
   name: playwright-service-config
 data:
   PORT: "3000"
+  ALLOW_LOCAL_WEBHOOKS: "false"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -23,7 +24,7 @@ spec:
         - name: docker-registry-secret
       containers:
         - name: playwright-service
-          image: ghcr.io/mendableai/playwright-service:latest
+          image: ghcr.io/firecrawl/playwright-service:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 3000

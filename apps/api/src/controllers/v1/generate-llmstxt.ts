@@ -1,3 +1,4 @@
+import { v7 as uuidv7 } from "uuid";
 import { Response } from "express";
 import {
   ErrorResponse,
@@ -8,11 +9,15 @@ import {
 import { getGenerateLlmsTxtQueue } from "../../services/queue-service";
 import * as Sentry from "@sentry/node";
 import { saveGeneratedLlmsTxt } from "../../lib/generate-llmstxt/generate-llmstxt-redis";
+import { logRequest } from "../../services/logging/log_job";
+import { getScrapeZDR } from "../../lib/zdr-helpers";
 
-export type GenerateLLMsTextResponse = ErrorResponse | {
-  success: boolean;
-  id: string;
-};
+type GenerateLLMsTextResponse =
+  | ErrorResponse
+  | {
+      success: boolean;
+      id: string;
+    };
 
 /**
  * Initiates a text generation job based on the provided URL.
@@ -24,17 +29,34 @@ export async function generateLLMsTextController(
   req: RequestWithAuth<{}, GenerateLLMsTextResponse, GenerateLLMsTextRequest>,
   res: Response<GenerateLLMsTextResponse>,
 ) {
-  if (req.acuc?.flags?.forceZDR) {
-    return res.status(400).json({ success: false, error: "Your team has zero data retention enabled. This is not supported on llmstxt. Please contact support@firecrawl.com to unblock this feature." });
+  if (getScrapeZDR(req.acuc?.flags) === "forced") {
+    return res.status(400).json({
+      success: false,
+      error:
+        "Your team has zero data retention enabled. This is not supported on llmstxt. Please contact support@firecrawl.com to unblock this feature.",
+    });
   }
 
   req.body = generateLLMsTextRequestSchema.parse(req.body);
 
-  const generationId = crypto.randomUUID();
+  const generationId = uuidv7();
+
+  await logRequest({
+    id: generationId,
+    kind: "llmstxt",
+    api_version: "v1",
+    team_id: req.auth.team_id,
+    origin: "api", // no origin field for llmstxt
+    target_hint: req.body.url,
+    zeroDataRetention: false, // not supported for llmstxt
+    api_key_id: req.acuc?.api_key_id ?? null,
+  });
+
   const jobData = {
     request: req.body,
     teamId: req.auth.team_id,
-    subId: req.acuc?.sub_id,
+    subId: req.acuc?.sub_id ?? undefined,
+    apiKeyId: req.acuc?.api_key_id ?? null,
     generationId,
   };
 

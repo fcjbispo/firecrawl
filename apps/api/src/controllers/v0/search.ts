@@ -4,29 +4,30 @@ import {
   checkTeamCredits,
 } from "../../services/billing/credit_billing";
 import { authenticateUser } from "../auth";
-import { RateLimiterMode } from "../../types";
-import { logJob } from "../../services/logging/log_job";
+import { RateLimiterMode, ScrapeJobSingleUrls } from "../../types";
+import { logSearch, logRequest } from "../../services/logging/log_job";
 import { PageOptions, SearchOptions } from "../../lib/entities";
 import { search } from "../../search";
 import { isUrlBlocked } from "../../scraper/WebScraper/utils/blocklist";
-import { v4 as uuidv4 } from "uuid";
+import { v7 as uuidv7 } from "uuid";
 import { logger } from "../../lib/logger";
-import { getScrapeQueue } from "../../services/queue-service";
 import { redisEvictConnection } from "../../../src/services/redis";
 import { addScrapeJob, waitForJob } from "../../services/queue-jobs";
 import * as Sentry from "@sentry/node";
 import { getJobPriority } from "../../lib/job-priority";
-import { Job } from "bullmq";
 import {
-  Document,
-  fromLegacyCombo,
   fromLegacyScrapeOptions,
   TeamFlags,
   toLegacyDocument,
 } from "../v1/types";
-import { getJobFromGCS } from "../../lib/gcs-jobs";
+import { fromV0Combo } from "../v2/types";
+import { ScrapeJobTimeoutError } from "../../lib/error";
+import { scrapeQueue } from "../../services/worker/nuq-router";
+import { defaultOrigin } from "../../lib/default-values";
+import { getSearchZDR } from "../../lib/zdr-helpers";
+import { applyAgentAuthDiscoveryHeader } from "../../lib/agent-auth-discovery";
 
-export async function searchHelper(
+async function searchHelper(
   jobId: string,
   req: Request,
   team_id: string,
@@ -35,6 +36,7 @@ export async function searchHelper(
   pageOptions: PageOptions,
   searchOptions: SearchOptions,
   flags: TeamFlags,
+  api_key_id: number | null,
 ): Promise<{
   success: boolean;
   error?: string;
@@ -58,11 +60,12 @@ export async function searchHelper(
   const num_results_buffer = Math.floor(num_results * 1.5);
 
   let res = await search({
-    query: query,
-    advanced: advanced,
+    query,
+    logger,
+    advanced,
     num_results: num_results_buffer,
-    tbs: tbs,
-    filter: filter,
+    tbs,
+    filter,
     lang: searchOptions.lang ?? "en",
     country: searchOptions.country ?? "us",
     location: searchOptions.location,
@@ -70,7 +73,7 @@ export async function searchHelper(
 
   let justSearch = pageOptions.fetchPageContent === false;
 
-  const { scrapeOptions, internalOptions } = fromLegacyCombo(
+  const { scrapeOptions, internalOptions } = fromV0Combo(
     pageOptions,
     undefined,
     60000,
@@ -79,16 +82,30 @@ export async function searchHelper(
   );
 
   if (justSearch) {
-    billTeam(team_id, subscription_id, res.length).catch((error) => {
+    const searchCredits = Math.ceil(res.length / 10) * 2;
+    billTeam(
+      team_id,
+      subscription_id,
+      searchCredits,
+      api_key_id,
+      { endpoint: "search", jobId },
+      logger,
+    ).catch(error => {
       logger.error(
-        `Failed to bill team ${team_id} for ${res.length} credits: ${error}`,
+        `Failed to bill team ${team_id} for ${searchCredits} credits: ${error}`,
       );
       // Optionally, you could notify an admin or add to a retry queue here
     });
     return { success: true, data: res, returnCode: 200 };
   }
 
-  res = res.filter((r) => !isUrlBlocked(r.url, flags));
+  res = res.filter(
+    r =>
+      !isUrlBlocked(r.url, flags, {
+        team_id,
+        origin: req.body?.origin ?? null,
+      }),
+  );
   if (res.length > num_results) {
     res = res.slice(0, num_results);
   }
@@ -98,14 +115,15 @@ export async function searchHelper(
   }
 
   const jobPriority = await getJobPriority({ team_id, basePriority: 20 });
+  const billing = { endpoint: "search" as const, jobId };
 
   // filter out social media links
 
-  const jobDatas = res.map((x) => {
+  const jobDatas = res.map(x => {
     const url = x.url;
-    const uuid = uuidv4();
+    const uuid = uuidv7();
     return {
-      name: uuid,
+      jobId: uuid,
       data: {
         url,
         mode: "single_urls" as const,
@@ -114,31 +132,28 @@ export async function searchHelper(
         internalOptions,
         startTime: Date.now(),
         zeroDataRetention: false, // not supported on v0
-      },
-      opts: {
-        jobId: uuid,
-        priority: jobPriority,
-      },
+        apiKeyId: api_key_id,
+        origin: req.body.origin ?? defaultOrigin,
+        requestId: jobId,
+        billing,
+      } satisfies ScrapeJobSingleUrls,
     };
   });
 
   // TODO: addScrapeJobs
   for (const job of jobDatas) {
-    await addScrapeJob(job.data, {}, job.opts.jobId, job.opts.priority);
+    await addScrapeJob(job.data, job.jobId, jobPriority, false, true);
   }
 
   const docs = (
-    await Promise.all(
-      jobDatas.map((x) => waitForJob(x.opts.jobId, 60000)),
-    )
-  ).map((x) => toLegacyDocument(x, internalOptions));
+    await Promise.all(jobDatas.map(x => waitForJob(x.jobId, 60000, false)))
+  ).map(x => toLegacyDocument(x, internalOptions));
 
   if (docs.length === 0) {
     return { success: true, error: "No search results found", returnCode: 200 };
   }
 
-  const sq = getScrapeQueue();
-  await Promise.all(jobDatas.map((x) => sq.remove(x.opts.jobId)));
+  await scrapeQueue.removeJobs(jobDatas.map(x => x.jobId));
 
   // make sure doc.content is not empty
   const filteredDocs = docs.filter(
@@ -166,17 +181,49 @@ export async function searchController(req: Request, res: Response) {
     // make sure to authenticate user first, Bearer <token>
     const auth = await authenticateUser(req, res, RateLimiterMode.Search);
     if (!auth.success) {
+      if (auth.status === 401) applyAgentAuthDiscoveryHeader(res);
       return res.status(auth.status).json({ error: auth.error });
     }
     const { team_id, chunk } = auth;
 
-    if (chunk?.flags?.forceZDR) {
-      return res.status(400).json({ error: "Your team has zero data retention enabled. This is not supported on the v0 API. Please update your code to use the v1 API." });
+    const v0SearchZDRMode = getSearchZDR(chunk?.flags);
+    if (v0SearchZDRMode === "forced-zdr" || v0SearchZDRMode === "forced-anon") {
+      return res.status(400).json({
+        error:
+          "Your team has zero data retention enabled. This is not supported on the v0 API. Please update your code to use the v1 API.",
+      });
     }
 
-    redisEvictConnection.sadd("teams_using_v0", team_id)
-      .catch(error => logger.error("Failed to add team to teams_using_v0", { error, team_id }));
-    
+    const jobId = uuidv7();
+
+    await logRequest({
+      id: jobId,
+      kind: "search",
+      api_version: "v0",
+      team_id,
+      origin: req.body.origin ?? "api",
+      integration: req.body.integration,
+      target_hint: req.body.query ?? "",
+      zeroDataRetention: false, // not supported on v0
+      api_key_id: chunk?.api_key_id ?? null,
+    });
+
+    redisEvictConnection.sadd("teams_using_v0", team_id).catch(error =>
+      logger.error("Failed to add team to teams_using_v0", {
+        error,
+        team_id,
+      }),
+    );
+
+    redisEvictConnection
+      .sadd("teams_using_v0:" + team_id, "search:" + jobId)
+      .catch(error =>
+        logger.error("Failed to add team to teams_using_v0 (2)", {
+          error,
+          team_id,
+        }),
+      );
+
     const crawlerOptions = req.body.crawlerOptions ?? {};
     const pageOptions = req.body.pageOptions ?? {
       includeHtml: req.body.pageOptions?.includeHtml ?? false,
@@ -188,8 +235,6 @@ export async function searchController(req: Request, res: Response) {
     const origin = req.body.origin ?? "api";
 
     const searchOptions = req.body.searchOptions ?? { limit: 5 };
-
-    const jobId = uuidv4();
 
     try {
       const { success: creditsCheckSuccess, message: creditsCheckMessage } =
@@ -212,32 +257,30 @@ export async function searchController(req: Request, res: Response) {
       pageOptions,
       searchOptions,
       chunk?.flags ?? null,
+      chunk?.api_key_id ?? null,
     );
     const endTime = new Date().getTime();
     const timeTakenInSeconds = (endTime - startTime) / 1000;
-    logJob({
-      job_id: jobId,
-      success: result.success,
-      message: result.error,
-      num_docs: result.data ? result.data.length : 0,
-      docs: result.data,
+    await logSearch({
+      id: jobId,
+      request_id: jobId,
+      query: req.body.query,
+      num_results: result.data?.length ?? 0,
+      is_successful: result.success,
+      error: result.error,
+      results: result.data,
       time_taken: timeTakenInSeconds,
       team_id: team_id,
-      mode: "search",
-      url: req.body.query,
-      scrapeOptions: fromLegacyScrapeOptions(req.body.pageOptions, undefined, 60000, team_id),
-      crawlerOptions: crawlerOptions,
-      origin,
-      integration: req.body.integration,
+      options: searchOptions,
+      credits_cost: pageOptions.fetchPageContent
+        ? 0
+        : Math.ceil((result.data?.length ?? 0) / 10) * 2,
       zeroDataRetention: false, // not supported
     });
     return res.status(result.returnCode).json(result);
   } catch (error) {
-    if (
-      error instanceof Error &&
-      (error.message.startsWith("Job wait") || error.message === "timeout")
-    ) {
-      return res.status(408).json({ error: "Request timed out" });
+    if (error instanceof ScrapeJobTimeoutError) {
+      return res.status(408).json({ error: error.message });
     }
 
     Sentry.captureException(error);

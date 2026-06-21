@@ -5,7 +5,6 @@ import {
   buildAnalyzeSchemaUserPrompt,
 } from "../../build-prompts";
 import { logger } from "../../../logger";
-import { jsonSchema } from "ai";
 import { getModel } from "../../../generic-ai";
 import {
   generateCompletions_F0,
@@ -16,7 +15,7 @@ export async function analyzeSchemaAndPrompt_F0(
   urls: string[],
   schema: any,
   prompt: string,
-  metadata: { teamId: string, extractId?: string }
+  metadata: { teamId: string; extractId?: string },
 ): Promise<{
   isMultiEntity: boolean;
   multiEntityKeys: string[];
@@ -30,17 +29,17 @@ export async function analyzeSchemaAndPrompt_F0(
 
   const schemaString = JSON.stringify(schema);
 
-  const model = getModel("gpt-4o");
+  const model = getModel("gpt-4.1");
 
   const checkSchema = z
     .object({
       isMultiEntity: z.boolean(),
-      multiEntityKeys: z.array(z.string()).optional().default([]),
+      multiEntityKeys: z.array(z.string()).optional().prefault([]),
       reasoning: z.string(),
       keyIndicators: z.array(z.string()),
     })
     .refine(
-      (x) => !x.isMultiEntity || x.multiEntityKeys.length > 0,
+      x => !x.isMultiEntity || x.multiEntityKeys.length > 0,
       "isMultiEntity was true, but no multiEntityKeys",
     );
 

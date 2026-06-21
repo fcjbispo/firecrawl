@@ -1,33 +1,22 @@
-import express, { NextFunction, Request, Response } from "express";
+import express from "express";
+import { config } from "../config";
 import { crawlController } from "../controllers/v1/crawl";
 // import { crawlStatusController } from "../../src/controllers/v1/crawl-status";
 import { scrapeController } from "../../src/controllers/v1/scrape";
 import { crawlStatusController } from "../controllers/v1/crawl-status";
 import { mapController } from "../controllers/v1/map";
-import {
-  ErrorResponse,
-  isAgentExtractModelValid,
-  RequestWithACUC,
-  RequestWithAuth,
-  RequestWithMaybeAuth,
-} from "../controllers/v1/types";
+import { RequestWithAuth } from "../controllers/v1/types";
 import { RateLimiterMode } from "../types";
-import { authenticateUser } from "../controllers/auth";
-import { createIdempotencyKey } from "../services/idempotency/create";
-import { validateIdempotencyKey } from "../services/idempotency/validate";
-import { checkTeamCredits } from "../services/billing/credit_billing";
+import { SEARCH_CREDITS_FEATURE_ID } from "../services/autumn/autumn.service";
 import expressWs from "express-ws";
 import { crawlStatusWSController } from "../controllers/v1/crawl-status-ws";
-import { isUrlBlocked } from "../scraper/WebScraper/utils/blocklist";
 import { crawlCancelController } from "../controllers/v1/crawl-cancel";
-import { logger } from "../lib/logger";
 import { scrapeStatusController } from "../controllers/v1/scrape-status";
 import { concurrencyCheckController } from "../controllers/v1/concurrency-check";
 import { batchScrapeController } from "../controllers/v1/batch-scrape";
 import { extractController } from "../controllers/v1/extract";
 import { extractStatusController } from "../controllers/v1/extract-status";
 import { creditUsageController } from "../controllers/v1/credit-usage";
-import { BLOCKLISTED_URL_MESSAGE } from "../lib/strings";
 import { searchController } from "../controllers/v1/search";
 import { x402SearchController } from "../controllers/v1/x402-search";
 import { crawlErrorsController } from "../controllers/v1/crawl-errors";
@@ -37,181 +26,106 @@ import { deepResearchController } from "../controllers/v1/deep-research";
 import { deepResearchStatusController } from "../controllers/v1/deep-research-status";
 import { tokenUsageController } from "../controllers/v1/token-usage";
 import { ongoingCrawlsController } from "../controllers/v1/crawl-ongoing";
-import { addDomainFrequencyJob } from "../services"
-import { paymentMiddleware } from "x402-express";
+import { fireclawController } from "../controllers/v1/fireclaw";
+import {
+  authMiddleware,
+  checkCreditsMiddleware,
+  blocklistMiddleware,
+  countryCheck,
+  idempotencyMiddleware,
+  requestTimingMiddleware,
+  validateJobIdParam,
+  wrap,
+} from "./shared";
+import { queueStatusController } from "../controllers/v1/queue-status";
+import { creditUsageHistoricalController } from "../controllers/v1/credit-usage-historical";
 
-function checkCreditsMiddleware(
-  _minimum?: number,
-): (req: RequestWithAuth, res: Response, next: NextFunction) => void {
-  return (req, res, next) => {
-    let minimum = _minimum;
-    (async () => {
-      if (!minimum && req.body) {
-        minimum =
-          (req.body as any)?.limit ?? (req.body as any)?.urls?.length ?? 1;
-      }
-      const { success, remainingCredits, chunk } = await checkTeamCredits(
-        req.acuc,
-        req.auth.team_id,
-        minimum ?? 1,
-      );
-      if (chunk) {
-        req.acuc = chunk;
-      }
-      req.account = { remainingCredits };
-      if (!success) {
-        if (!minimum && req.body && (req.body as any).limit !== undefined && remainingCredits > 0) {
-          logger.warn("Adjusting limit to remaining credits", {
-            teamId: req.auth.team_id,
-            remainingCredits,
-            request: req.body,
-          });
-          (req.body as any).limit = remainingCredits;
-          return next();
-        }
-
-        const currencyName = req.acuc.is_extract ? "tokens" : "credits"
-        logger.error(
-          `Insufficient ${currencyName}: ${JSON.stringify({ team_id: req.auth.team_id, minimum, remainingCredits })}`,
-          {
-            teamId: req.auth.team_id,
-            minimum,
-            remainingCredits,
-            request: req.body,
-            path: req.path
-          }
-        );
-        if (!res.headersSent && req.auth.team_id !== "8c528896-7882-4587-a4b6-768b721b0b53") {
-          return res.status(402).json({
-            success: false,
-            error:
-              "Insufficient " + currencyName + " to perform this request. For more " + currencyName + ", you can upgrade your plan at " + (currencyName === "credits" ? "https://firecrawl.dev/pricing or try changing the request limit to a lower value" : "https://www.firecrawl.dev/extract#pricing") + ".",
-          });
-        }
-      }
-      next();
-    })().catch((err) => next(err));
-  };
-}
-
-export function authMiddleware(
-  rateLimiterMode: RateLimiterMode
-): (req: RequestWithMaybeAuth, res: Response, next: NextFunction) => void {
-  return (req, res, next) => {
-    (async () => {
-      let currentRateLimiterMode = rateLimiterMode;
-      if (currentRateLimiterMode === RateLimiterMode.Extract && isAgentExtractModelValid((req.body as any)?.agent?.model)) {
-        currentRateLimiterMode = RateLimiterMode.ExtractAgentPreview;
-      }
-
-    // Track domain frequency regardless of caching
-    try {
-      // Use the URL from the request body if available
-      const urlToTrack = (req.body as any)?.url;
-      if (urlToTrack) {
-        await addDomainFrequencyJob(urlToTrack);
-      }
-    } catch (error) {
-      // Log error without meta.logger since it's not available in this context
-      logger.warn("Failed to track domain frequency", { error });
-    }
-
-      // if (currentRateLimiterMode === RateLimiterMode.Scrape && isAgentExtractModelValid((req.body as any)?.agent?.model)) {
-      //   currentRateLimiterMode = RateLimiterMode.ScrapeAgentPreview;
-      // }
-
-      const auth = await authenticateUser(req, res, currentRateLimiterMode);
-
-      if (!auth.success) {
-        if (!res.headersSent) {
-          return res
-            .status(auth.status)
-            .json({ success: false, error: auth.error });
-        } else {
-          return;
-        }
-      }
-
-      const { team_id, chunk } = auth;
-
-      req.auth = { team_id };
-      req.acuc = chunk ?? undefined;
-      if (chunk) {
-        req.account = { remainingCredits: chunk.remaining_credits };
-      }
-      next();
-    })().catch((err) => next(err));
-  };
-}
-
-function idempotencyMiddleware(
-  req: Request,
-  res: Response,
-  next: NextFunction,
-) {
-  (async () => {
-    if (req.headers["x-idempotency-key"]) {
-      const isIdempotencyValid = await validateIdempotencyKey(req);
-      if (!isIdempotencyValid) {
-        if (!res.headersSent) {
-          return res
-            .status(409)
-            .json({ success: false, error: "Idempotency key already used" });
-        }
-      }
-      createIdempotencyKey(req);
-    }
-    next();
-  })().catch((err) => next(err));
-}
-
-function blocklistMiddleware(req: RequestWithACUC<any, any, any>, res: Response, next: NextFunction) {
-  if (typeof req.body.url === "string" && isUrlBlocked(req.body.url, req.acuc?.flags ?? null)) {
-    if (!res.headersSent) {
-      return res.status(403).json({
-        success: false,
-        error: BLOCKLISTED_URL_MESSAGE,
-      });
-    }
-  }
-  next();
-}
-
-export function wrap(
-  controller: (req: Request, res: Response) => Promise<any>,
-): (req: Request, res: Response, next: NextFunction) => any {
-  return (req, res, next) => {
-    controller(req, res).catch((err) => next(err));
-  };
-}
+import { tokenUsageHistoricalController } from "../controllers/v1/token-usage-historical";
+import {
+  paymentMiddleware,
+  getX402ResourceServer,
+  createX402RouteConfig,
+  isX402Enabled,
+} from "../lib/x402";
+import { deprecationMiddleware } from "../lib/deprecations";
 
 expressWs(express());
 
 export const v1Router = express.Router();
 
+// Add timing middleware to all v1 routes
+v1Router.use(requestTimingMiddleware("v1"));
+
 // Configure payment middleware to enable micropayment-protected endpoints
 // This middleware handles payment verification and processing for premium API features
 // x402 payments protocol - https://github.com/coinbase/x402
-v1Router.use(
-  paymentMiddleware(
-    process.env.X402_PAY_TO_ADDRESS as `0x${string}` || "0x0000000000000000000000000000000000000000",
-    {
-      "POST /x402/search": {
-        price: process.env.X402_ENDPOINT_PRICE_USD as string,
-        network: process.env.X402_NETWORK as "base-sepolia" | "base" | "avalanche-fuji" | "avalanche" | "iotex",
-        config: {
-          description: "The search endpoint combines web search (SERP) with Firecrawl's scraping capabilities to return full page content for any query. Requires micropayment via X402 protocol",
-          mimeType: "application/json",
-          maxTimeoutSeconds: 120,
-        }
-      },
-    },
-  ),
-);
+// v1Router.use(
+//   paymentMiddleware(
+//     (config.X402_PAY_TO_ADDRESS as `0x${string}`) ||
+//       "0x0000000000000000000000000000000000000000",
+//     {
+//       "POST /x402/search": {
+//         price: config.X402_ENDPOINT_PRICE_USD as string,
+//         network: config.X402_NETWORK as
+//           | "base-sepolia"
+//           | "base"
+//           | "avalanche-fuji"
+//           | "avalanche"
+//           | "iotex",
+//         config: {
+//           discoverable: true,
+//           description:
+//             "The search endpoint combines web search (SERP) with Firecrawl's scraping capabilities to return full page content for any query. Requires micropayment via X402 protocol",
+//           mimeType: "application/json",
+//           maxTimeoutSeconds: 120,
+//           inputSchema: {
+//             body: {
+//               query: {
+//                 type: "string",
+//                 description: "Search query to find relevant web pages",
+//                 required: true,
+//               },
+//               limit: {
+//                 type: "number",
+//                 description: "Maximum number of results to return (max 10)",
+//                 required: false,
+//               },
+//               scrapeOptions: {
+//                 type: "object",
+//                 description: "Options for scraping the found pages",
+//                 required: false,
+//               },
+//             },
+//           },
+//           outputSchema: {
+//             type: "object",
+//             properties: {
+//               success: { type: "boolean" },
+//               data: {
+//                 type: "array",
+//                 items: {
+//                   type: "object",
+//                   properties: {
+//                     url: { type: "string" },
+//                     title: { type: "string" },
+//                     description: { type: "string" },
+//                     markdown: { type: "string" },
+//                   },
+//                 },
+//               },
+//             },
+//           },
+//         },
+//       },
+//     },
+//     facilitator,
+//   ),
+// );
 
 v1Router.post(
   "/scrape",
-  authMiddleware(RateLimiterMode.Scrape),
+  authMiddleware(RateLimiterMode.Scrape, { allowKeyless: true }),
+  countryCheck,
   checkCreditsMiddleware(1),
   blocklistMiddleware,
   wrap(scrapeController),
@@ -220,6 +134,7 @@ v1Router.post(
 v1Router.post(
   "/crawl",
   authMiddleware(RateLimiterMode.Crawl),
+  countryCheck,
   checkCreditsMiddleware(),
   blocklistMiddleware,
   idempotencyMiddleware,
@@ -229,6 +144,7 @@ v1Router.post(
 v1Router.post(
   "/batch/scrape",
   authMiddleware(RateLimiterMode.Scrape),
+  countryCheck,
   checkCreditsMiddleware(),
   blocklistMiddleware,
   idempotencyMiddleware,
@@ -237,8 +153,9 @@ v1Router.post(
 
 v1Router.post(
   "/search",
-  authMiddleware(RateLimiterMode.Search),
-  checkCreditsMiddleware(),
+  authMiddleware(RateLimiterMode.Search, { allowKeyless: true }),
+  countryCheck,
+  checkCreditsMiddleware(undefined, SEARCH_CREDITS_FEATURE_ID),
   wrap(searchController),
 );
 
@@ -266,12 +183,14 @@ v1Router.get(
 v1Router.get(
   "/crawl/:jobId",
   authMiddleware(RateLimiterMode.CrawlStatus),
+  validateJobIdParam,
   wrap(crawlStatusController),
 );
 
 v1Router.get(
   "/batch/scrape/:jobId",
   authMiddleware(RateLimiterMode.CrawlStatus),
+  validateJobIdParam,
   // Yes, it uses the same controller as the normal crawl status controller
   wrap((req: any, res): any => crawlStatusController(req, res, true)),
 );
@@ -305,19 +224,24 @@ v1Router.ws("/crawl/:jobId", crawlStatusWSController);
 v1Router.post(
   "/extract",
   authMiddleware(RateLimiterMode.Extract),
-  checkCreditsMiddleware(1),
+  deprecationMiddleware("v1_extract"),
+  countryCheck,
+  checkCreditsMiddleware(20),
   wrap(extractController),
 );
 
 v1Router.get(
   "/extract/:jobId",
   authMiddleware(RateLimiterMode.ExtractStatus),
+  deprecationMiddleware("v1_extract_status"),
   wrap(extractStatusController),
 );
 
 v1Router.post(
   "/llmstxt",
   authMiddleware(RateLimiterMode.Scrape),
+  deprecationMiddleware("v1_llmstxt"),
+  countryCheck,
   blocklistMiddleware,
   wrap(generateLLMsTextController),
 );
@@ -325,12 +249,15 @@ v1Router.post(
 v1Router.get(
   "/llmstxt/:jobId",
   authMiddleware(RateLimiterMode.CrawlStatus),
+  deprecationMiddleware("v1_llmstxt_status"),
   wrap(generateLLMsTextStatusController),
 );
 
 v1Router.post(
   "/deep-research",
   authMiddleware(RateLimiterMode.Crawl),
+  deprecationMiddleware("v1_deep_research"),
+  countryCheck,
   checkCreditsMiddleware(1),
   wrap(deepResearchController),
 );
@@ -338,6 +265,7 @@ v1Router.post(
 v1Router.get(
   "/deep-research/:jobId",
   authMiddleware(RateLimiterMode.CrawlStatus),
+  deprecationMiddleware("v1_deep_research_status"),
   wrap(deepResearchStatusController),
 );
 
@@ -366,20 +294,58 @@ v1Router.delete(
 // v1Router.get("/health/liveness", livenessController);
 // v1Router.get("/health/readiness", readinessController);
 
+v1Router.post(
+  "/fireclaw",
+  authMiddleware(RateLimiterMode.Scrape),
+  checkCreditsMiddleware(100),
+  wrap(fireclawController),
+);
+
 v1Router.get(
   "/team/credit-usage",
-  authMiddleware(RateLimiterMode.CrawlStatus),
+  authMiddleware(RateLimiterMode.Account),
   wrap(creditUsageController),
 );
 
 v1Router.get(
+  "/team/credit-usage/historical",
+  authMiddleware(RateLimiterMode.Account),
+  wrap(creditUsageHistoricalController),
+);
+
+v1Router.get(
   "/team/token-usage",
-  authMiddleware(RateLimiterMode.ExtractStatus),
+  authMiddleware(RateLimiterMode.Account),
   wrap(tokenUsageController),
 );
 
-v1Router.post(
-  "/x402/search",
-  authMiddleware(RateLimiterMode.Search),
-  wrap(x402SearchController),
+v1Router.get(
+  "/team/token-usage/historical",
+  authMiddleware(RateLimiterMode.Account),
+  wrap(tokenUsageHistoricalController),
 );
+
+v1Router.get(
+  "/team/queue-status",
+  authMiddleware(RateLimiterMode.Account),
+  wrap(queueStatusController),
+);
+
+// Only register x402 routes if X402_PAY_TO_ADDRESS is configured
+if (isX402Enabled()) {
+  v1Router.post(
+    "/x402/search",
+    authMiddleware(RateLimiterMode.Search),
+    countryCheck,
+    paymentMiddleware(
+      createX402RouteConfig(
+        "POST /x402/search",
+        "The search endpoint combines web search (SERP) with Firecrawl's scraping capabilities to return full page content for any query. Requires micropayment via X402 protocol",
+        {},
+        {},
+      ),
+      getX402ResourceServer(),
+    ),
+    wrap(x402SearchController),
+  );
+}

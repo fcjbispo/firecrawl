@@ -10,14 +10,20 @@ import {
 } from "../build-prompts";
 import { getModel } from "../../../lib/generic-ai";
 import { Logger } from "winston";
-import { CostTracking } from "../extraction-service";
+import { CostTracking } from "../../cost-tracking";
 export async function analyzeSchemaAndPrompt(
   urls: string[],
   schema: any,
   prompt: string,
   logger: Logger,
   costTracking: CostTracking,
-  metadata: { teamId: string, functionId?: string, extractId?: string, scrapeId?: string, deepResearchId?: string },
+  metadata: {
+    teamId: string;
+    functionId?: string;
+    extractId?: string;
+    scrapeId?: string;
+    deepResearchId?: string;
+  },
 ): Promise<{
   isMultiEntity: boolean;
   multiEntityKeys: string[];
@@ -26,26 +32,33 @@ export async function analyzeSchemaAndPrompt(
   tokenUsage: TokenUsage;
 }> {
   if (!schema) {
-    const genRes = await generateSchemaFromPrompt(prompt, logger, costTracking, {
-      ...metadata,
-      functionId: metadata.functionId ? (metadata.functionId + "/analyzeSchemaAndPrompt") : "analyzeSchemaAndPrompt",
-    });
+    const genRes = await generateSchemaFromPrompt(
+      prompt,
+      logger,
+      costTracking,
+      {
+        ...metadata,
+        functionId: metadata.functionId
+          ? metadata.functionId + "/analyzeSchemaAndPrompt"
+          : "analyzeSchemaAndPrompt",
+      },
+    );
     schema = genRes.extract;
   }
 
   const schemaString = JSON.stringify(schema);
 
-  const model = getModel("gpt-4o", "openai");
+  const model = getModel("gpt-4.1", "openai");
 
   const checkSchema = z
     .object({
       isMultiEntity: z.boolean(),
-      multiEntityKeys: z.array(z.string()).optional().default([]),
+      multiEntityKeys: z.array(z.string()).optional().prefault([]),
       reasoning: z.string(),
       keyIndicators: z.array(z.string()),
     })
     .refine(
-      (x) => !x.isMultiEntity || x.multiEntityKeys.length > 0,
+      x => !x.isMultiEntity || x.multiEntityKeys.length > 0,
       "isMultiEntity was true, but no multiEntityKeys",
     );
 
@@ -53,7 +66,6 @@ export async function analyzeSchemaAndPrompt(
     const { extract: result, totalUsage } = await generateCompletions({
       logger,
       options: {
-        mode: "llm",
         schema: checkSchema,
         prompt: buildAnalyzeSchemaUserPrompt(schemaString, prompt, urls),
         systemPrompt: buildAnalyzeSchemaPrompt(),
@@ -62,14 +74,16 @@ export async function analyzeSchemaAndPrompt(
       model,
       costTrackingOptions: {
         costTracking,
-        metadata: { 
+        metadata: {
           module: "extract",
           method: "analyzeSchemaAndPrompt",
         },
       },
       metadata: {
         ...metadata,
-        functionId: metadata.functionId ? (metadata.functionId + "/analyzeSchemaAndPrompt") : "analyzeSchemaAndPrompt",
+        functionId: metadata.functionId
+          ? metadata.functionId + "/analyzeSchemaAndPrompt"
+          : "analyzeSchemaAndPrompt",
       },
     });
 
